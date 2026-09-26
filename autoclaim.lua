@@ -800,7 +800,6 @@ local function print_usage()
     windower.add_to_chat(158, '//ac type <ja|ma>')
     windower.add_to_chat(158, '//ac ability <name>')
     windower.add_to_chat(158, '//ac ws <name> [<name> ...]')
-    windower.add_to_chat(158, '//ac timeout <seconds>')
     windower.add_to_chat(158, '[AutoClaim] WS names can be quoted or separated with |')
 end
 
