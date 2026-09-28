@@ -1250,7 +1250,7 @@ local function claim_mob(mob)
         -- without ever releasing the locked target while the claim is pending.
         if claim_sent_at then
             if now - claim_sent_at < CLAIM_RESPONSE_TIMEOUT then
-                coroutine.schedule(claim_loop, 0.05)
+                coroutine.schedule(claim_loop, 0.02)
                 return
             end
 
@@ -1286,7 +1286,7 @@ local function claim_mob(mob)
         end
 
         -- No menu/chat dependency. The packet goes directly to THIS mob.
-        if now - last_claim_action >= 0.15 then
+        if now - last_claim_action >= 0.05 then
             target_mob(current)
             face_target(current)
 
