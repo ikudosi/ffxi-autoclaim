@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.15'
+_addon.version = '5.14'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -45,6 +45,10 @@ local FAILED_TARGET_COOLDOWN = 1.5
 -- before allowing another packet attempt.
 local CLAIM_RESPONSE_TIMEOUT = 0.20
 local CLAIM_MAX_WAIT = 60.0
+-- If the claim action goes on recast without us receiving ownership,
+-- do not sit on the mob. Release it so the scanner can keep watching it.
+-- A short grace period allows a slightly delayed claim update to arrive.
+local CLAIM_RECAST_RELEASE_GRACE = 0.50
 
 local WS_TP = 1000
 local FACE_INTERVAL = 0.05
@@ -52,7 +56,6 @@ local last_face = 0
 local ws_armed = true
 local ws_pending_until = 0
 local WS_PENDING_DELAY = 1.50
-local ws_submission_pending = false
 local last_engage = 0
 local ENGAGE_RETRY = 0.40
 
@@ -895,8 +898,10 @@ local function use_weapon_skill()
         return false
     end
 
-    if ws_submission_pending then
-        return nil
+    local target = windower.ffxi.get_mob_by_target('t')
+
+    if not target or target.id ~= locked.id then
+        return false
     end
 
     local weapon_skill = current_weapon_skill()
@@ -905,140 +910,25 @@ local function use_weapon_skill()
         return false
     end
 
-    -- Force the exact locked mob onto <t> before attempting the WS.
-    -- The previous implementation simply aborted if <t> was momentarily
-    -- out of sync, which could leave an overnight run permanently
-    -- weaponskill-free.
-    target_mob(locked)
-    face_target(locked)
-
-    local generation = claim_generation
-    local target_id = locked.id
-
-    ws_submission_pending = true
-
     windower.add_to_chat(
         158,
         string.format(
-            '[AutoClaim] WS ready: %s (%d TP) -> %s',
+            '[AutoClaim] WS: %s (%d TP) [%d/%d]',
             weapon_skill,
             player.vitals.tp,
-            locked.name
+            WS_INDEX,
+            #WEAPON_SKILLS
         )
     )
 
-    local function clear_pending()
-        ws_submission_pending = false
-    end
+    windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
+    advance_weapon_skill()
 
-    coroutine.schedule(function()
-        if generation ~= claim_generation
-            or not locked_target
-            or locked_target ~= target_id then
-            clear_pending()
-            return
-        end
+    -- Give the WS time to actually execute before maintenance magic can
+    -- interrupt it. The simple TP latch still controls one WS per 1000 TP.
+    ws_pending_until = os.clock() + WS_PENDING_DELAY
 
-        local p = windower.ffxi.get_player()
-        local current = windower.ffxi.get_mob_by_id(target_id)
-
-        if not p
-            or p.status ~= 1
-            or not p.vitals
-            or p.vitals.tp < WS_TP
-            or not current
-            or not current.hpp
-            or current.hpp <= 0
-            or current.claim_id ~= p.id then
-            clear_pending()
-            return
-        end
-
-        target_mob(current)
-        face_target(current)
-
-        local target = windower.ffxi.get_mob_by_target('t')
-
-        if not target or target.id ~= current.id then
-            windower.add_to_chat(
-                123,
-                '[AutoClaim] WS target sync failed; retrying.'
-            )
-
-            coroutine.schedule(function()
-                if generation ~= claim_generation
-                    or not locked_target
-                    or locked_target ~= target_id then
-                    clear_pending()
-                    return
-                end
-
-                local retry_player = windower.ffxi.get_player()
-                local retry = windower.ffxi.get_mob_by_id(target_id)
-
-                if not retry_player
-                    or retry_player.status ~= 1
-                    or not retry_player.vitals
-                    or retry_player.vitals.tp < WS_TP
-                    or not retry
-                    or not retry.hpp
-                    or retry.hpp <= 0
-                    or retry.claim_id ~= retry_player.id then
-                    clear_pending()
-                    return
-                end
-
-                target_mob(retry)
-                face_target(retry)
-
-                local retry_target = windower.ffxi.get_mob_by_target('t')
-
-                if retry_target and retry_target.id == retry.id then
-                    windower.add_to_chat(
-                        158,
-                        string.format(
-                            '[AutoClaim] WS: %s (%d TP) [%d/%d]',
-                            weapon_skill,
-                            retry_player.vitals.tp,
-                            WS_INDEX,
-                            #WEAPON_SKILLS
-                        )
-                    )
-
-                    windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
-                    advance_weapon_skill()
-                    ws_pending_until = os.clock() + WS_PENDING_DELAY
-                    clear_pending()
-                else
-                    windower.add_to_chat(
-                        123,
-                        '[AutoClaim] WS retry target sync failed.'
-                    )
-                    clear_pending()
-                end
-            end, 0.10)
-
-            return
-        end
-
-        windower.add_to_chat(
-            158,
-            string.format(
-                '[AutoClaim] WS: %s (%d TP) [%d/%d]',
-                weapon_skill,
-                p.vitals.tp,
-                WS_INDEX,
-                #WEAPON_SKILLS
-            )
-        )
-
-        windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
-        advance_weapon_skill()
-        ws_pending_until = os.clock() + WS_PENDING_DELAY
-        clear_pending()
-    end, 0.05)
-
-    return nil
+    return true
 end
 
 ------------------------------------------------------------
@@ -1046,6 +936,15 @@ end
 ------------------------------------------------------------
 
 local function claim_mob(mob)
+    -- Never lock a fresh mob when the configured claim ability is already
+    -- on recast. The scanner will keep watching and will take the mob as
+    -- soon as the ability becomes available instead of staring at it.
+    local initial_recast = claim_recast()
+
+    if initial_recast > 0 then
+        return
+    end
+
     -- One and only one claim can exist at a time.
     if busy or locked_target then
         return
@@ -1250,7 +1149,7 @@ local function claim_mob(mob)
         -- without ever releasing the locked target while the claim is pending.
         if claim_sent_at then
             if now - claim_sent_at < CLAIM_RESPONSE_TIMEOUT then
-                coroutine.schedule(claim_loop, 0.02)
+                coroutine.schedule(claim_loop, 0.05)
                 return
             end
 
@@ -1260,20 +1159,28 @@ local function claim_mob(mob)
         local recast = claim_recast()
 
         if recast > 0 then
-            if now - claim_started >= CLAIM_MAX_WAIT then
+            -- The important distinction: an ability being on recast means
+            -- another claim packet cannot currently be submitted. Do not
+            -- hold the mob hostage for seconds while waiting on recast.
+            --
+            -- If this packet was just sent, give the server a brief grace
+            -- window to update claim_id before releasing the target.
+            local since_last_send = last_claim_action > 0
+                and (now - last_claim_action)
+                or math.huge
+
+            if since_last_send >= CLAIM_RECAST_RELEASE_GRACE then
                 release(
                     string.format(
-                        'Waited %.0fs for %s on %s. Releasing target.',
-                        CLAIM_MAX_WAIT,
-                        CLAIM_ABILITY,
-                        current.name
+                        'Claim action on recast (%.1fs) without ownership. Releasing target.',
+                        recast
                     ),
-                    true
+                    false
                 )
                 return
             end
 
-            coroutine.schedule(claim_loop, 0.20)
+            coroutine.schedule(claim_loop, 0.05)
             return
         end
 
@@ -1286,7 +1193,7 @@ local function claim_mob(mob)
         end
 
         -- No menu/chat dependency. The packet goes directly to THIS mob.
-        if now - last_claim_action >= 0.05 then
+        if now - last_claim_action >= 0.15 then
             target_mob(current)
             face_target(current)
 
@@ -1442,7 +1349,6 @@ windower.register_event('prerender', function()
             reset_weapon_skill_cycle()
             ws_armed = true
             ws_pending_until = 0
-            ws_submission_pending = false
             return
         end
 
@@ -1454,7 +1360,6 @@ windower.register_event('prerender', function()
             reset_weapon_skill_cycle()
             ws_armed = true
             ws_pending_until = 0
-            ws_submission_pending = false
             return
         end
 
@@ -1646,7 +1551,6 @@ windower.register_event('addon command', function(...)
         reset_weapon_skill_cycle()
         ws_armed = true
         ws_pending_until = 0
-        ws_submission_pending = false
 
         windower.add_to_chat(
             158,
@@ -1664,7 +1568,6 @@ windower.register_event('addon command', function(...)
             reset_weapon_skill_cycle()
             ws_armed = true
             ws_pending_until = 0
-            ws_submission_pending = false
         end
 
         windower.add_to_chat(
@@ -2205,7 +2108,7 @@ windower.register_event('load', function()
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Loaded v5.15 - target filters + multi-aggro priority + synchronized WS + upkeep'
+        '[AutoClaim] Loaded v5.17 - target filters + multi-aggro priority + WS + upkeep'
     )
 
     windower.add_to_chat(
