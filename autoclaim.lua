@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.8'
+_addon.version = '5.10'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -52,6 +52,38 @@ local last_face = 0
 local ws_armed = true
 local last_engage = 0
 local ENGAGE_RETRY = 0.40
+
+------------------------------------------------------------
+-- Optional upkeep
+------------------------------------------------------------
+--
+-- Disabled by default. Configure at runtime with:
+--
+--   //ac upkeep ja add "Majesty"
+--   //ac upkeep ja add "Sentinel" 5
+--   //ac upkeep ja remove "Sentinel"
+--   //ac upkeep food "Grape Daifuku" 1800 60
+--   //ac upkeep food off
+--   //ac upkeep on
+--
+-- For Job Abilities, the Windower resource provides the buff status and
+-- duration for normal buff-type JAs. The optional lead value says how many
+-- seconds before the expected expiration we should refresh it.
+--
+-- Food uses the standard Food buff (ID 251) and a user-supplied duration,
+-- because the food buff itself does not identify the remaining duration.
+local UPKEEP_ENABLED = false
+local UPKEEP_CHECK_INTERVAL = 0.50
+local UPKEEP_JA_RETRY_DELAY = 2.0
+local UPKEEP_FOOD_RETRY_DELAY = 10.0
+local FOOD_BUFF_ID = 251
+
+local UPKEEP_JAS = {}
+local UPKEEP_MAS = {}
+local UPKEEP_FOOD = nil
+local upkeep_next_check = 0
+local upkeep_food_expires = 0
+local upkeep_food_next_attempt = 0
 
 ------------------------------------------------------------
 -- Target / facing
@@ -183,6 +215,344 @@ end
 
 local function reset_weapon_skill_cycle()
     WS_INDEX = 1
+end
+
+------------------------------------------------------------
+-- Upkeep helpers
+------------------------------------------------------------
+
+local function player_has_buff(buff_id, player)
+    if not buff_id or not player then
+        return false
+    end
+
+    for _, active_id in pairs(player.buffs or {}) do
+        if active_id == buff_id then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function find_upkeep_ja(name)
+    local needle = tostring(name):lower()
+
+    for index, entry in ipairs(UPKEEP_JAS) do
+        if entry.name:lower() == needle then
+            return index, entry
+        end
+    end
+
+    return nil
+end
+
+local function resolve_upkeep_ja(name)
+    local ability = res.job_abilities:with('en', name)
+
+    if not ability then
+        return nil, 'Unable to resolve Job Ability: ' .. tostring(name)
+    end
+
+    if ability.prefix ~= '/jobability'
+        or not ability.recast_id
+        or ability.status == nil
+        or not ability.duration
+        or ability.duration <= 0 then
+        return nil, string.format(
+            '%s is not a renewable buff-type Job Ability according to Windower resources.',
+            ability.en
+        )
+    end
+
+    return {
+        name = ability.en,
+        id = ability.id,
+        recast_id = ability.recast_id,
+        buff_id = ability.status,
+        duration = ability.duration,
+        lead = 5,
+        next_attempt = 0,
+        active_until = 0,
+    }
+end
+
+local function upkeep_recast(entry)
+    local recasts = windower.ffxi.get_ability_recasts()
+
+    if not recasts then
+        return 999999
+    end
+
+    return recasts[entry.recast_id] or 999999
+end
+
+local function find_upkeep_ma(name)
+    local needle = tostring(name):lower()
+
+    for index, entry in ipairs(UPKEEP_MAS) do
+        if entry.name:lower() == needle then
+            return index, entry
+        end
+    end
+
+    return nil
+end
+
+local function resolve_upkeep_ma(name)
+    local spell = res.spells:with('en', name)
+
+    if not spell then
+        return nil, 'Unable to resolve spell: ' .. tostring(name)
+    end
+
+    if spell.prefix ~= '/magic'
+        or not spell.recast_id
+        or spell.status == nil
+        or not spell.duration
+        or spell.duration <= 0 then
+        return nil, string.format(
+            '%s is not a renewable buff-type magic spell according to Windower resources.',
+            spell.en
+        )
+    end
+
+    return {
+        name = spell.en,
+        id = spell.id,
+        recast_id = spell.recast_id,
+        buff_id = spell.status,
+        duration = spell.duration,
+        mp_cost = spell.mp_cost or 0,
+        lead = 5,
+        next_attempt = 0,
+        active_until = 0,
+    }
+end
+
+local function upkeep_spell_recast(entry)
+    local recasts = windower.ffxi.get_spell_recasts()
+
+    if not recasts then
+        return 999999
+    end
+
+    return recasts[entry.recast_id] or 999999
+end
+
+local function initialize_upkeep_state(player)
+    local now = os.clock()
+
+    for _, entry in ipairs(UPKEEP_JAS) do
+        if player_has_buff(entry.buff_id, player) then
+            entry.active_until = now + math.max(1, entry.duration - entry.lead)
+        else
+            entry.active_until = 0
+        end
+    end
+
+    for _, entry in ipairs(UPKEEP_MAS) do
+        if player_has_buff(entry.buff_id, player) then
+            entry.active_until = now + math.max(1, entry.duration - entry.lead)
+        else
+            entry.active_until = 0
+        end
+    end
+
+    if UPKEEP_FOOD and player_has_buff(FOOD_BUFF_ID, player) then
+        upkeep_food_expires = now + math.max(1, UPKEEP_FOOD.duration - UPKEEP_FOOD.lead)
+    else
+        upkeep_food_expires = 0
+    end
+end
+
+local function use_upkeep_ja(entry, now, player)
+    if not player
+    or player.status > 1
+    or now < entry.next_attempt
+    or now < entry.active_until then
+        return false
+    end
+
+    if upkeep_recast(entry) > 0 then
+        return false
+    end
+
+    -- Give a ready WS priority over a maintenance JA.
+    if player.status == 1
+    and player.vitals
+    and player.vitals.tp >= WS_TP then
+        return false
+    end
+
+    windower.chat.input('/ja "' .. entry.name .. '" <me>')
+
+    entry.next_attempt = now + UPKEEP_JA_RETRY_DELAY
+
+    windower.add_to_chat(
+        158,
+        '[AutoClaim] Upkeep JA: ' .. entry.name
+    )
+
+    return true
+end
+
+local function use_upkeep_ma(entry, now, player)
+    if not player
+    or player.status > 1
+    or now < entry.next_attempt
+    or now < entry.active_until then
+        return false
+    end
+
+    if upkeep_spell_recast(entry) > 0 then
+        return false
+    end
+
+    -- Do not try to cast a spell we cannot currently afford.
+    if entry.mp_cost > 0
+    and (not player.vitals or (player.vitals.mp or 0) < entry.mp_cost) then
+        return false
+    end
+
+    -- Give a ready WS priority over maintenance magic.
+    if player.status == 1
+    and player.vitals
+    and player.vitals.tp >= WS_TP then
+        return false
+    end
+
+    windower.chat.input('/ma "' .. entry.name .. '" <me>')
+
+    entry.next_attempt = now + UPKEEP_JA_RETRY_DELAY
+
+    windower.add_to_chat(
+        158,
+        '[AutoClaim] Upkeep MA: ' .. entry.name
+    )
+
+    return true
+end
+
+local function use_upkeep_food(now, player)
+    if not UPKEEP_FOOD
+    or player.status ~= 0
+    or now < upkeep_food_next_attempt
+    or now < upkeep_food_expires then
+        return false
+    end
+
+    if player_has_buff(FOOD_BUFF_ID, player) then
+        upkeep_food_expires = now + math.max(1, UPKEEP_FOOD.duration - UPKEEP_FOOD.lead)
+        return false
+    end
+
+    windower.chat.input('/item "' .. UPKEEP_FOOD.name .. '" <me>')
+
+    upkeep_food_next_attempt = now + UPKEEP_FOOD_RETRY_DELAY
+
+    windower.add_to_chat(
+        158,
+        '[AutoClaim] Upkeep Food: ' .. UPKEEP_FOOD.name
+    )
+
+    return true
+end
+
+local function upkeep_tick(now, player)
+    if not UPKEEP_ENABLED
+    or now < upkeep_next_check
+    or not player
+    or player.status > 1
+    or busy then
+        return false
+    end
+
+    upkeep_next_check = now + UPKEEP_CHECK_INTERVAL
+
+    -- One maintenance action at a time.
+    for _, entry in ipairs(UPKEEP_JAS) do
+        if use_upkeep_ja(entry, now, player) then
+            return true
+        end
+    end
+
+    for _, entry in ipairs(UPKEEP_MAS) do
+        if use_upkeep_ma(entry, now, player) then
+            return true
+        end
+    end
+
+    if use_upkeep_food(now, player) then
+        return true
+    end
+
+    return false
+end
+
+local function print_upkeep_status()
+    windower.add_to_chat(
+        158,
+        '[AutoClaim] Upkeep: ' .. (UPKEEP_ENABLED and 'ON' or 'OFF')
+    )
+
+    if #UPKEEP_JAS == 0 then
+        windower.add_to_chat(158, '[AutoClaim] Upkeep JAs: none')
+    else
+        local player = windower.ffxi.get_player()
+
+        for _, entry in ipairs(UPKEEP_JAS) do
+            windower.add_to_chat(
+                158,
+                string.format(
+                    '[AutoClaim] JA: %s | active=%s | recast=%.1fs | duration=%ds | lead=%ds',
+                    entry.name,
+                    player_has_buff(entry.buff_id, player) and 'yes' or 'no',
+                    upkeep_recast(entry),
+                    entry.duration,
+                    entry.lead
+                )
+            )
+        end
+    end
+
+    if #UPKEEP_MAS == 0 then
+        windower.add_to_chat(158, '[AutoClaim] Upkeep MAs: none')
+    else
+        local player = windower.ffxi.get_player()
+
+        for _, entry in ipairs(UPKEEP_MAS) do
+            windower.add_to_chat(
+                158,
+                string.format(
+                    '[AutoClaim] MA: %s | active=%s | recast=%.1fs | mp=%d | duration=%ds | lead=%ds',
+                    entry.name,
+                    player_has_buff(entry.buff_id, player) and 'yes' or 'no',
+                    upkeep_spell_recast(entry),
+                    entry.mp_cost,
+                    entry.duration,
+                    entry.lead
+                )
+            )
+        end
+    end
+
+    if UPKEEP_FOOD then
+        local player = windower.ffxi.get_player()
+
+        windower.add_to_chat(
+            158,
+            string.format(
+                '[AutoClaim] Food: %s | active=%s | duration=%ds | lead=%ds',
+                UPKEEP_FOOD.name,
+                player_has_buff(FOOD_BUFF_ID, player) and 'yes' or 'no',
+                UPKEEP_FOOD.duration,
+                UPKEEP_FOOD.lead
+            )
+        )
+    else
+        windower.add_to_chat(158, '[AutoClaim] Food: none')
+    end
 end
 
 ------------------------------------------------------------
@@ -794,6 +1164,56 @@ windower.register_event('action', function(action)
 end)
 
 ------------------------------------------------------------
+-- Upkeep buff events
+------------------------------------------------------------
+
+windower.register_event('gain buff', function(buff_id)
+    local now = os.clock()
+
+    for _, entry in ipairs(UPKEEP_JAS) do
+        if entry.buff_id == buff_id then
+            entry.active_until = now + math.max(1, entry.duration - entry.lead)
+            entry.next_attempt = now
+        end
+    end
+
+    for _, entry in ipairs(UPKEEP_MAS) do
+        if entry.buff_id == buff_id then
+            entry.active_until = now + math.max(1, entry.duration - entry.lead)
+            entry.next_attempt = now
+        end
+    end
+
+    if UPKEEP_FOOD and buff_id == FOOD_BUFF_ID then
+        upkeep_food_expires = now + math.max(1, UPKEEP_FOOD.duration - UPKEEP_FOOD.lead)
+        upkeep_food_next_attempt = now
+    end
+end)
+
+windower.register_event('lose buff', function(buff_id)
+    local now = os.clock()
+
+    for _, entry in ipairs(UPKEEP_JAS) do
+        if entry.buff_id == buff_id then
+            entry.active_until = 0
+            entry.next_attempt = now
+        end
+    end
+
+    for _, entry in ipairs(UPKEEP_MAS) do
+        if entry.buff_id == buff_id then
+            entry.active_until = 0
+            entry.next_attempt = now
+        end
+    end
+
+    if buff_id == FOOD_BUFF_ID then
+        upkeep_food_expires = 0
+        upkeep_food_next_attempt = now
+    end
+end)
+
+------------------------------------------------------------
 -- Main watchdog
 ------------------------------------------------------------
 
@@ -806,6 +1226,12 @@ windower.register_event('prerender', function()
     local player = windower.ffxi.get_player()
 
     if not player then
+        return
+    end
+
+    -- Maintenance actions have priority, but only one action is issued per
+    -- upkeep tick. The claim/engage/WS state machine remains untouched.
+    if upkeep_tick(now, player) then
         return
     end
 
@@ -948,6 +1374,13 @@ local function print_usage()
     windower.add_to_chat(158, '//ac ability <name>')
     windower.add_to_chat(158, '//ac ws <name> [<name> ...]')
     windower.add_to_chat(158, '[AutoClaim] WS names can be quoted or separated with |')
+    windower.add_to_chat(158, '//ac upkeep on | off | list | clear')
+    windower.add_to_chat(158, '//ac upkeep ja add <name> [lead]')
+    windower.add_to_chat(158, '//ac upkeep ja remove <name>')
+    windower.add_to_chat(158, '//ac upkeep ma add <name> [lead]')
+    windower.add_to_chat(158, '//ac upkeep ma remove <name>')
+    windower.add_to_chat(158, '//ac upkeep food <item> <duration> [lead]')
+    windower.add_to_chat(158, '//ac upkeep food off')
 end
 
 local function parse_ws_arguments(args)
@@ -1196,9 +1629,316 @@ windower.register_event('addon command', function(...)
             )
         end
 
+    elseif command == 'upkeep' then
+
+        local subcommand = args[2] and args[2]:lower() or ''
+
+        if subcommand == 'on' then
+            UPKEEP_ENABLED = true
+
+            local player = windower.ffxi.get_player()
+            if player then
+                initialize_upkeep_state(player)
+            end
+
+            windower.add_to_chat(158, '[AutoClaim] Upkeep ON')
+
+        elseif subcommand == 'off' then
+            UPKEEP_ENABLED = false
+            windower.add_to_chat(158, '[AutoClaim] Upkeep OFF')
+
+        elseif subcommand == 'list' or subcommand == '' then
+            print_upkeep_status()
+
+        elseif subcommand == 'clear' then
+            UPKEEP_JAS = {}
+            UPKEEP_MAS = {}
+            UPKEEP_FOOD = nil
+            upkeep_food_expires = 0
+            upkeep_food_next_attempt = 0
+
+            windower.add_to_chat(
+                158,
+                '[AutoClaim] Upkeep configuration cleared.'
+            )
+
+        elseif subcommand == 'ja' then
+
+            local action = args[3] and args[3]:lower() or ''
+
+            if action == 'add' then
+                if not args[4] then
+                    windower.add_to_chat(
+                        123,
+                        '[AutoClaim] Usage: //ac upkeep ja add <name> [lead]'
+                    )
+                    return
+                end
+
+                local parts = {}
+                for i = 4, #args do
+                    parts[#parts + 1] = args[i]
+                end
+
+                local lead = 5
+                local last = tonumber(parts[#parts])
+
+                if last then
+                    lead = math.max(0, last)
+                    parts[#parts] = nil
+                end
+
+                local name = table.concat(parts, ' ')
+                name = name:gsub('^"(.*)"$', '%1')
+
+                local entry, err = resolve_upkeep_ja(name)
+
+                if not entry then
+                    windower.add_to_chat(123, '[AutoClaim] ' .. err)
+                    return
+                end
+
+                entry.lead = lead
+
+                local existing_index = find_upkeep_ja(entry.name)
+
+                if existing_index then
+                    UPKEEP_JAS[existing_index] = entry
+                    windower.add_to_chat(
+                        158,
+                        '[AutoClaim] Upkeep JA updated: ' .. entry.name
+                    )
+                else
+                    UPKEEP_JAS[#UPKEEP_JAS + 1] = entry
+                    windower.add_to_chat(
+                        158,
+                        '[AutoClaim] Upkeep JA added: ' .. entry.name
+                    )
+                end
+
+                local player = windower.ffxi.get_player()
+                if player then
+                    initialize_upkeep_state(player)
+                end
+
+            elseif action == 'remove' then
+                if not args[4] then
+                    windower.add_to_chat(
+                        123,
+                        '[AutoClaim] Usage: //ac upkeep ja remove <name>'
+                    )
+                    return
+                end
+
+                local parts = {}
+                for i = 4, #args do
+                    parts[#parts + 1] = args[i]
+                end
+
+                local name = table.concat(parts, ' ')
+                name = name:gsub('^"(.*)"$', '%1')
+
+                local index, entry = find_upkeep_ja(name)
+
+                if index then
+                    table.remove(UPKEEP_JAS, index)
+                    windower.add_to_chat(
+                        158,
+                        '[AutoClaim] Upkeep JA removed: ' .. entry.name
+                    )
+                else
+                    windower.add_to_chat(
+                        123,
+                        '[AutoClaim] Upkeep JA not found: ' .. name
+                    )
+                end
+
+            else
+                windower.add_to_chat(
+                    123,
+                    '[AutoClaim] Usage: //ac upkeep ja add|remove <name> [lead]'
+                )
+            end
+
+        elseif subcommand == 'ma' then
+
+            local action = args[3] and args[3]:lower() or ''
+
+            if action == 'add' then
+                if not args[4] then
+                    windower.add_to_chat(
+                        123,
+                        '[AutoClaim] Usage: //ac upkeep ma add <name> [lead]'
+                    )
+                    return
+                end
+
+                local parts = {}
+                for i = 4, #args do
+                    parts[#parts + 1] = args[i]
+                end
+
+                local lead = 5
+                local last = tonumber(parts[#parts])
+
+                if last then
+                    lead = math.max(0, last)
+                    parts[#parts] = nil
+                end
+
+                local name = table.concat(parts, ' ')
+                name = name:gsub('^"(.*)"$', '%1')
+
+                local entry, err = resolve_upkeep_ma(name)
+
+                if not entry then
+                    windower.add_to_chat(123, '[AutoClaim] ' .. err)
+                    return
+                end
+
+                entry.lead = lead
+
+                local existing_index = find_upkeep_ma(entry.name)
+
+                if existing_index then
+                    UPKEEP_MAS[existing_index] = entry
+                    windower.add_to_chat(
+                        158,
+                        '[AutoClaim] Upkeep MA updated: ' .. entry.name
+                    )
+                else
+                    UPKEEP_MAS[#UPKEEP_MAS + 1] = entry
+                    windower.add_to_chat(
+                        158,
+                        '[AutoClaim] Upkeep MA added: ' .. entry.name
+                    )
+                end
+
+                local player = windower.ffxi.get_player()
+                if player then
+                    initialize_upkeep_state(player)
+                end
+
+            elseif action == 'remove' then
+                if not args[4] then
+                    windower.add_to_chat(
+                        123,
+                        '[AutoClaim] Usage: //ac upkeep ma remove <name>'
+                    )
+                    return
+                end
+
+                local parts = {}
+                for i = 4, #args do
+                    parts[#parts + 1] = args[i]
+                end
+
+                local name = table.concat(parts, ' ')
+                name = name:gsub('^"(.*)"$', '%1')
+
+                local index, entry = find_upkeep_ma(name)
+
+                if index then
+                    table.remove(UPKEEP_MAS, index)
+                    windower.add_to_chat(
+                        158,
+                        '[AutoClaim] Upkeep MA removed: ' .. entry.name
+                    )
+                else
+                    windower.add_to_chat(
+                        123,
+                        '[AutoClaim] Upkeep MA not found: ' .. name
+                    )
+                end
+
+            else
+                windower.add_to_chat(
+                    123,
+                    '[AutoClaim] Usage: //ac upkeep ma add|remove <name> [lead]'
+                )
+            end
+
+        elseif subcommand == 'food' then
+
+            if not args[3] or args[3]:lower() == 'off' then
+                UPKEEP_FOOD = nil
+                upkeep_food_expires = 0
+                upkeep_food_next_attempt = 0
+
+                windower.add_to_chat(
+                    158,
+                    '[AutoClaim] Upkeep food disabled.'
+                )
+                return
+            end
+
+            -- Syntax:
+            -- //ac upkeep food "Grape Daifuku" 1800 60
+            -- duration is required; lead is optional.
+            local raw = {}
+            for i = 3, #args do
+                raw[#raw + 1] = args[i]
+            end
+
+            local duration = tonumber(raw[#raw])
+            if not duration or duration <= 0 then
+                windower.add_to_chat(
+                    123,
+                    '[AutoClaim] Usage: //ac upkeep food <item> <duration> [lead]'
+                )
+                return
+            end
+            raw[#raw] = nil
+
+            local lead = 60
+            local possible_lead = tonumber(raw[#raw])
+            if possible_lead then
+                lead = math.max(0, possible_lead)
+                raw[#raw] = nil
+            end
+
+            local item_name = table.concat(raw, ' ')
+            item_name = item_name:gsub('^"(.*)"$', '%1')
+
+            local item = res.items:with('en', item_name)
+
+            if not item then
+                windower.add_to_chat(
+                    123,
+                    '[AutoClaim] Unable to resolve food item: ' .. item_name
+                )
+                return
+            end
+
+            UPKEEP_FOOD = {
+                name = item.en,
+                id = item.id,
+                duration = duration,
+                lead = lead,
+            }
+
+            local player = windower.ffxi.get_player()
+            if player then
+                initialize_upkeep_state(player)
+            end
+
+            windower.add_to_chat(
+                158,
+                string.format(
+                    '[AutoClaim] Upkeep food set: %s | duration=%ds | lead=%ds',
+                    UPKEEP_FOOD.name,
+                    UPKEEP_FOOD.duration,
+                    UPKEEP_FOOD.lead
+                )
+            )
+
+        else
+            print_usage()
+        end
+
     elseif command == 'status' then
 
-        local target_name = 'none'
+        local target_name = 'none' 
 
         if locked_target then
             local mob = windower.ffxi.get_mob_by_id(locked_target)
@@ -1225,6 +1965,8 @@ windower.register_event('addon command', function(...)
             )
         )
 
+        print_upkeep_status()
+
     elseif command == 'help' then
 
         print_usage()
@@ -1238,9 +1980,14 @@ end)
 windower.register_event('load', function()
     resolve_claim_ability()
 
+    local player = windower.ffxi.get_player()
+    if player then
+        initialize_upkeep_state(player)
+    end
+
     windower.add_to_chat(
         158,
-        '[AutoClaim] Loaded v5.8 - target filters + multi-aggro priority + WS'
+        '[AutoClaim] Loaded v5.9 - target filters + multi-aggro priority + WS + upkeep'
     )
 
     windower.add_to_chat(
