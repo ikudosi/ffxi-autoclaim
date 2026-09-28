@@ -52,6 +52,7 @@ local last_face = 0
 local ws_armed = true
 local ws_pending_until = 0
 local WS_PENDING_DELAY = 1.50
+local ws_submission_pending = false
 local last_engage = 0
 local ENGAGE_RETRY = 0.40
 
@@ -278,7 +279,6 @@ local function resolve_upkeep_ja(name)
         next_attempt = 0,
         active_until = 0,
         casting_until = 0,
-        awaiting_buff = false,
     }
 end
 
@@ -377,38 +377,16 @@ end
 local function use_upkeep_ja(entry, now, player)
     if not player
     or player.status > 1
-    or now < entry.next_attempt
-    or now < (entry.casting_until or 0)
-    or now < ws_pending_until
-    then
+    or now < entry.next_attempt then
         return false
     end
 
     local buff_active = player_has_buff(entry.buff_id, player)
 
-    -- Once a JA has been submitted, wait for the buff event before
-    -- considering another cast. This prevents the upkeep JA from becoming
-    -- a repeating action while the client/server state catches up.
-    if entry.awaiting_buff then
-        if buff_active then
-            entry.awaiting_buff = false
-            entry.casting_until = 0
-            entry.next_attempt = now
-        elseif now < entry.next_attempt then
-            return false
-        else
-            -- Allow one retry after the previous JA had time to resolve.
-            entry.awaiting_buff = false
-        end
-    end
-
-    if buff_active then
-        if now < entry.active_until then
-            return false
-        end
-
-        -- The buff is still actually present. Do not refresh solely because
-        -- our predicted timer expired; wait for the real lose-buff event.
+    -- Trust the live buff list over the predicted expiry timestamp.  If the
+    -- buff has already disappeared, refresh immediately even when the old
+    -- active_until value has not been reached yet.
+    if buff_active and now < entry.active_until then
         return false
     end
 
@@ -416,23 +394,20 @@ local function use_upkeep_ja(entry, now, player)
         return false
     end
 
-    -- Never allow maintenance JA to compete with a ready WS.
+    -- Give a ready WS priority over a maintenance JA.
     if player.status == 1
     and player.vitals
-    and player.vitals.tp >= WS_TP
-    and ws_armed then
+    and player.vitals.tp >= WS_TP then
         return false
     end
 
     windower.chat.input('/ja "' .. entry.name .. '" <me>')
 
-    entry.casting_until = now + 1.0
     entry.next_attempt = now + UPKEEP_JA_RETRY_DELAY
-    entry.awaiting_buff = true
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Upkeep JA: ' .. entry.name .. ' (waiting for buff)'
+        '[AutoClaim] Upkeep JA: ' .. entry.name
     )
 
     return true
@@ -920,10 +895,8 @@ local function use_weapon_skill()
         return false
     end
 
-    local target = windower.ffxi.get_mob_by_target('t')
-
-    if not target or target.id ~= locked.id then
-        return false
+    if ws_submission_pending then
+        return nil
     end
 
     local weapon_skill = current_weapon_skill()
@@ -932,25 +905,140 @@ local function use_weapon_skill()
         return false
     end
 
+    -- Force the exact locked mob onto <t> before attempting the WS.
+    -- The previous implementation simply aborted if <t> was momentarily
+    -- out of sync, which could leave an overnight run permanently
+    -- weaponskill-free.
+    target_mob(locked)
+    face_target(locked)
+
+    local generation = claim_generation
+    local target_id = locked.id
+
+    ws_submission_pending = true
+
     windower.add_to_chat(
         158,
         string.format(
-            '[AutoClaim] WS: %s (%d TP) [%d/%d]',
+            '[AutoClaim] WS ready: %s (%d TP) -> %s',
             weapon_skill,
             player.vitals.tp,
-            WS_INDEX,
-            #WEAPON_SKILLS
+            locked.name
         )
     )
 
-    windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
-    advance_weapon_skill()
+    local function clear_pending()
+        ws_submission_pending = false
+    end
 
-    -- Give the WS time to actually execute before maintenance magic can
-    -- interrupt it. The simple TP latch still controls one WS per 1000 TP.
-    ws_pending_until = os.clock() + WS_PENDING_DELAY
+    coroutine.schedule(function()
+        if generation ~= claim_generation
+            or not locked_target
+            or locked_target ~= target_id then
+            clear_pending()
+            return
+        end
 
-    return true
+        local p = windower.ffxi.get_player()
+        local current = windower.ffxi.get_mob_by_id(target_id)
+
+        if not p
+            or p.status ~= 1
+            or not p.vitals
+            or p.vitals.tp < WS_TP
+            or not current
+            or not current.hpp
+            or current.hpp <= 0
+            or current.claim_id ~= p.id then
+            clear_pending()
+            return
+        end
+
+        target_mob(current)
+        face_target(current)
+
+        local target = windower.ffxi.get_mob_by_target('t')
+
+        if not target or target.id ~= current.id then
+            windower.add_to_chat(
+                123,
+                '[AutoClaim] WS target sync failed; retrying.'
+            )
+
+            coroutine.schedule(function()
+                if generation ~= claim_generation
+                    or not locked_target
+                    or locked_target ~= target_id then
+                    clear_pending()
+                    return
+                end
+
+                local retry_player = windower.ffxi.get_player()
+                local retry = windower.ffxi.get_mob_by_id(target_id)
+
+                if not retry_player
+                    or retry_player.status ~= 1
+                    or not retry_player.vitals
+                    or retry_player.vitals.tp < WS_TP
+                    or not retry
+                    or not retry.hpp
+                    or retry.hpp <= 0
+                    or retry.claim_id ~= retry_player.id then
+                    clear_pending()
+                    return
+                end
+
+                target_mob(retry)
+                face_target(retry)
+
+                local retry_target = windower.ffxi.get_mob_by_target('t')
+
+                if retry_target and retry_target.id == retry.id then
+                    windower.add_to_chat(
+                        158,
+                        string.format(
+                            '[AutoClaim] WS: %s (%d TP) [%d/%d]',
+                            weapon_skill,
+                            retry_player.vitals.tp,
+                            WS_INDEX,
+                            #WEAPON_SKILLS
+                        )
+                    )
+
+                    windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
+                    advance_weapon_skill()
+                    ws_pending_until = os.clock() + WS_PENDING_DELAY
+                    clear_pending()
+                else
+                    windower.add_to_chat(
+                        123,
+                        '[AutoClaim] WS retry target sync failed.'
+                    )
+                    clear_pending()
+                end
+            end, 0.10)
+
+            return
+        end
+
+        windower.add_to_chat(
+            158,
+            string.format(
+                '[AutoClaim] WS: %s (%d TP) [%d/%d]',
+                weapon_skill,
+                p.vitals.tp,
+                WS_INDEX,
+                #WEAPON_SKILLS
+            )
+        )
+
+        windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
+        advance_weapon_skill()
+        ws_pending_until = os.clock() + WS_PENDING_DELAY
+        clear_pending()
+    end, 0.05)
+
+    return nil
 end
 
 ------------------------------------------------------------
@@ -1354,6 +1442,7 @@ windower.register_event('prerender', function()
             reset_weapon_skill_cycle()
             ws_armed = true
             ws_pending_until = 0
+            ws_submission_pending = false
             return
         end
 
@@ -1365,6 +1454,7 @@ windower.register_event('prerender', function()
             reset_weapon_skill_cycle()
             ws_armed = true
             ws_pending_until = 0
+            ws_submission_pending = false
             return
         end
 
@@ -1556,6 +1646,7 @@ windower.register_event('addon command', function(...)
         reset_weapon_skill_cycle()
         ws_armed = true
         ws_pending_until = 0
+        ws_submission_pending = false
 
         windower.add_to_chat(
             158,
@@ -1573,6 +1664,7 @@ windower.register_event('addon command', function(...)
             reset_weapon_skill_cycle()
             ws_armed = true
             ws_pending_until = 0
+            ws_submission_pending = false
         end
 
         windower.add_to_chat(
@@ -2113,7 +2205,7 @@ windower.register_event('load', function()
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Loaded v5.14 - target filters + multi-aggro priority + WS + upkeep'
+        '[AutoClaim] Loaded v5.15 - target filters + multi-aggro priority + synchronized WS + upkeep'
     )
 
     windower.add_to_chat(
