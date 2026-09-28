@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.6'
+_addon.version = '5.8'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -27,6 +27,16 @@ local busy = false
 local claim_generation = 0
 local last_scan = 0
 
+-- Optional exact-name filter. When set, ONLY mobs with this exact name
+-- (case-insensitive) are eligible for automatic claiming.
+local TARGET_ONLY_NAME = nil
+
+-- Mobs that have recently performed an action against the player are
+-- prioritized over ordinary unclaimed mobs. This is tracked from the
+-- Windower action event because mob.target_index is not reliable for NPCs.
+local recent_attackers = {}
+local ATTACKER_PRIORITY_DURATION = 3.0
+
 -- A failed/expired target is temporarily ignored by the scanner.
 local failed_targets = {}
 local FAILED_TARGET_COOLDOWN = 1.5
@@ -37,10 +47,9 @@ local CLAIM_RESPONSE_TIMEOUT = 0.20
 local CLAIM_MAX_WAIT = 60.0
 
 local WS_TP = 1000
-local WS_DELAY = 1.0
 local FACE_INTERVAL = 0.05
 local last_face = 0
-local last_ws = 0
+local ws_armed = true
 local last_engage = 0
 local ENGAGE_RETRY = 0.40
 
@@ -234,6 +243,50 @@ end
 -- Scanner
 ------------------------------------------------------------
 
+local function target_name_matches(mob)
+    if not mob then
+        return false
+    end
+
+    if not TARGET_ONLY_NAME or TARGET_ONLY_NAME == '' then
+        return true
+    end
+
+    return mob.name
+        and mob.name:lower() == TARGET_ONLY_NAME:lower()
+end
+
+local function remember_attacker(mob_id)
+    if mob_id then
+        recent_attackers[mob_id] = os.clock() + ATTACKER_PRIORITY_DURATION
+    end
+end
+
+local function is_recent_attacker(mob_id)
+    local expires = recent_attackers[mob_id]
+
+    if not expires then
+        return false
+    end
+
+    if os.clock() >= expires then
+        recent_attackers[mob_id] = nil
+        return false
+    end
+
+    return true
+end
+
+local function cleanup_recent_attackers()
+    local now = os.clock()
+
+    for mob_id, expires in pairs(recent_attackers) do
+        if now >= expires then
+            recent_attackers[mob_id] = nil
+        end
+    end
+end
+
 local function blacklist_target(mob_id)
     if mob_id then
         failed_targets[mob_id] = os.clock() + FAILED_TARGET_COOLDOWN
@@ -255,6 +308,28 @@ local function is_target_blacklisted(mob_id)
     return true
 end
 
+local function is_eligible_mob(mob, player)
+    if not mob
+        or not mob.id
+        or not mob.index
+        or not mob.name
+        or not player
+        or mob.id == player.id
+        or not mob.is_npc
+        or not mob.hpp
+        or mob.hpp <= 0
+        or not mob.valid_target
+        or mob.spawn_type ~= 16
+        or is_target_blacklisted(mob.id)
+        or not target_name_matches(mob) then
+        return false
+    end
+
+    -- We can only claim unclaimed mobs, or continue with one already
+    -- claimed by us.
+    return mob.claim_id == 0 or mob.claim_id == nil or mob.claim_id == player.id
+end
+
 local function find_mob()
     local player = windower.ffxi.get_player()
 
@@ -274,23 +349,74 @@ local function find_mob()
         return nil
     end
 
+    cleanup_recent_attackers()
+
+    ------------------------------------------------------------
+    -- PRIORITY 1:
+    -- A mob that actually attacked us recently wins immediately.
+    ------------------------------------------------------------
+
+    local attacker = nil
+    local attacker_distance = MAX_DISTANCE
+
+    for _, mob in pairs(mobs) do
+        if is_eligible_mob(mob, player)
+        and is_recent_attacker(mob.id) then
+            local dist = math.sqrt(mob.distance or 999999)
+
+            if dist <= attacker_distance then
+                attacker = mob
+                attacker_distance = dist
+            end
+        end
+    end
+
+    if attacker then
+        return attacker
+    end
+
+    ------------------------------------------------------------
+    -- PRIORITY 2:
+    -- If we already have multiple mobs claimed by us (for example,
+    -- because we aggroed 3 mobs at once), keep working through those
+    -- mobs before claiming a fresh one.
+    --
+    -- This is the important distinction from the old scanner:
+    -- claim_id == player.id means the mob is already ours, so we
+    -- should NOT send another claim attempt just to select it.
+    ------------------------------------------------------------
+
+    local owned = nil
+    local owned_distance = MAX_DISTANCE
+
+    for _, mob in pairs(mobs) do
+        if is_eligible_mob(mob, player)
+        and mob.claim_id == player.id then
+            local dist = math.sqrt(mob.distance or 999999)
+
+            if dist <= owned_distance then
+                owned = mob
+                owned_distance = dist
+            end
+        end
+    end
+
+    if owned then
+        return owned
+    end
+
+    ------------------------------------------------------------
+    -- PRIORITY 3:
+    -- Nothing is attacking us and we don't already own another mob,
+    -- so claim the nearest fresh/unclaimed matching mob.
+    ------------------------------------------------------------
+
     local closest = nil
     local closest_distance = MAX_DISTANCE
 
     for _, mob in pairs(mobs) do
-        if mob
-        and mob.id
-        and mob.index
-        and mob.name
-        and mob.id ~= player.id                 -- NEVER target ourselves
-        and mob.is_npc
-        and mob.hpp
-        and mob.hpp > 0
-        and mob.valid_target
-        and mob.spawn_type == 16
-        and (mob.claim_id == 0 or mob.claim_id == nil)
-        and not is_target_blacklisted(mob.id) then
-
+        if is_eligible_mob(mob, player)
+        and (mob.claim_id == 0 or mob.claim_id == nil) then
             local dist = math.sqrt(mob.distance or 999999)
 
             if dist <= closest_distance then
@@ -311,11 +437,11 @@ local function use_weapon_skill()
     local player = windower.ffxi.get_player()
 
     if not player or player.status ~= 1 then
-        return
+        return false
     end
 
     if not locked_target then
-        return
+        return false
     end
 
     local locked = windower.ffxi.get_mob_by_id(locked_target)
@@ -324,23 +450,23 @@ local function use_weapon_skill()
     or not locked.hpp
     or locked.hpp <= 0
     or locked.claim_id ~= player.id then
-        return
+        return false
     end
 
     if not player.vitals or player.vitals.tp < WS_TP then
-        return
+        return false
     end
 
     local target = windower.ffxi.get_mob_by_target('t')
 
     if not target or target.id ~= locked.id then
-        return
+        return false
     end
 
     local weapon_skill = current_weapon_skill()
 
     if not weapon_skill then
-        return
+        return false
     end
 
     windower.add_to_chat(
@@ -356,6 +482,8 @@ local function use_weapon_skill()
 
     windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
     advance_weapon_skill()
+
+    return true
 end
 
 ------------------------------------------------------------
@@ -374,6 +502,7 @@ local function claim_mob(mob)
     busy = true
     locked_target = mob.id
     reset_weapon_skill_cycle()
+    ws_armed = true
 
     local claim_started = os.clock()
     local claim_sent_at = nil
@@ -627,6 +756,44 @@ local function claim_mob(mob)
 end
 
 ------------------------------------------------------------
+-- Incoming combat priority
+------------------------------------------------------------
+
+-- A monster can attack us before the scanner has selected anything.
+-- The action event gives us a reliable signal that the monster actually
+-- acted on the player. We remember it briefly so the scanner can claim
+-- that monster before choosing a different nearby mob.
+windower.register_event('action', function(action)
+    if not enabled or not action or not action.actor_id or not action.targets then
+        return
+    end
+
+    local player = windower.ffxi.get_player()
+
+    if not player then
+        return
+    end
+
+    local actor = windower.ffxi.get_mob_by_id(action.actor_id)
+
+    if not actor
+        or not actor.is_npc
+        or actor.spawn_type ~= 16
+        or not actor.hpp
+        or actor.hpp <= 0
+        or not target_name_matches(actor) then
+        return
+    end
+
+    for _, target in pairs(action.targets) do
+        if target and target.id == player.id then
+            remember_attacker(actor.id)
+            return
+        end
+    end
+end)
+
+------------------------------------------------------------
 -- Main watchdog
 ------------------------------------------------------------
 
@@ -675,49 +842,27 @@ windower.register_event('prerender', function()
 
         --------------------------------------------------------
         -- WS only after we actually own the locked mob.
+        --
+        -- Keep this in one function so the same validation/logging
+        -- path is used regardless of how the target was acquired.
         --------------------------------------------------------
 
-        if player.status == 1
+        -- Simple WS trigger:
+        --   TP < 1000  -> arm the WS
+        --   TP >= 1000 -> submit the configured WS once
+        --   stay disarmed until TP drops below 1000 again
+        if player.vitals and player.vitals.tp < WS_TP then
+            ws_armed = true
+        end
+
+        if ws_armed
+        and player.status == 1
         and player.vitals
         and player.vitals.tp >= WS_TP
-        and now - last_ws >= WS_DELAY
         and mob.claim_id == player.id then
-
-            target_mob(mob)
-            face_target(mob)
-
-            local generation = claim_generation
-
-            coroutine.schedule(function()
-                if generation ~= claim_generation
-                    or not locked_target
-                    or locked_target ~= mob.id then
-                    return
-                end
-
-                local p = windower.ffxi.get_player()
-                local current = windower.ffxi.get_mob_by_id(mob.id)
-
-                if p
-                and p.status == 1
-                and p.vitals
-                and p.vitals.tp >= WS_TP
-                and current
-                and current.hpp
-                and current.hpp > 0
-                and current.claim_id == p.id then
-
-                    target_mob(current)
-                    face_target(current)
-                    local weapon_skill = current_weapon_skill()
-
-                    if weapon_skill then
-                        windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
-                        advance_weapon_skill()
-                        last_ws = os.clock()
-                    end
-                end
-            end, 0.05)
+            if use_weapon_skill() then
+                ws_armed = false
+            end
         end
 
         --------------------------------------------------------
@@ -797,6 +942,8 @@ local function print_usage()
     windower.add_to_chat(158, '[AutoClaim] Commands:')
     windower.add_to_chat(158, '//ac on | off | toggle | status')
     windower.add_to_chat(158, '//ac range <yalms>')
+    windower.add_to_chat(158, '//ac target_only <mob name>')
+    windower.add_to_chat(158, '//ac target_only off')
     windower.add_to_chat(158, '//ac type <ja|ma>')
     windower.add_to_chat(158, '//ac ability <name>')
     windower.add_to_chat(158, '//ac ws <name> [<name> ...]')
@@ -850,6 +997,7 @@ windower.register_event('addon command', function(...)
         locked_target = nil
         claim_generation = claim_generation + 1
         reset_weapon_skill_cycle()
+        ws_armed = true
 
         windower.add_to_chat(
             158,
@@ -865,6 +1013,7 @@ windower.register_event('addon command', function(...)
             locked_target = nil
             claim_generation = claim_generation + 1
             reset_weapon_skill_cycle()
+            ws_armed = true
         end
 
         windower.add_to_chat(
@@ -891,6 +1040,46 @@ windower.register_event('addon command', function(...)
             windower.add_to_chat(
                 123,
                 '[AutoClaim] Usage: //ac range <yalms>'
+            )
+        end
+
+    elseif command == 'target_only' then
+
+        if not args[2] then
+            windower.add_to_chat(
+                123,
+                '[AutoClaim] Usage: //ac target_only <mob name>'
+            )
+            windower.add_to_chat(
+                123,
+                '[AutoClaim] Or: //ac target_only off'
+            )
+            return
+        end
+
+        local parts = {}
+
+        for i = 2, #args do
+            parts[#parts + 1] = args[i]
+        end
+
+        local value = table.concat(parts, ' ')
+        value = value:gsub('^%s+', ''):gsub('%s+$', '')
+        value = value:gsub('^"(.*)"$', '%1')
+
+        if value:lower() == 'off' or value == '' then
+            TARGET_ONLY_NAME = nil
+
+            windower.add_to_chat(
+                158,
+                '[AutoClaim] Target-only filter cleared.'
+            )
+        else
+            TARGET_ONLY_NAME = value
+
+            windower.add_to_chat(
+                158,
+                '[AutoClaim] Target-only filter set to: ' .. TARGET_ONLY_NAME
             )
         end
 
@@ -1021,9 +1210,10 @@ windower.register_event('addon command', function(...)
         windower.add_to_chat(
             158,
             string.format(
-                '[AutoClaim] %s | locked=%s | %s %s id=%s recast=%.1fs | timeout=%.2fs | WS=%s [%d/%d]',
+                '[AutoClaim] %s | locked=%s | only=%s | %s %s id=%s recast=%.1fs | timeout=%.2fs | WS=%s [%d/%d]',
                 enabled and 'ON' or 'OFF',
                 target_name,
+                TARGET_ONLY_NAME or 'any',
                 CLAIM_TYPE:upper(),
                 CLAIM_ABILITY,
                 tostring(CLAIM_ACTION_ID or 'nil'),
@@ -1050,7 +1240,7 @@ windower.register_event('load', function()
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Loaded v5.6 - direct packet claim'
+        '[AutoClaim] Loaded v5.8 - target filters + multi-aggro priority + WS'
     )
 
     windower.add_to_chat(
