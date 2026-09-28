@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.10'
+_addon.version = '5.15'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -50,6 +50,8 @@ local WS_TP = 1000
 local FACE_INTERVAL = 0.05
 local last_face = 0
 local ws_armed = true
+local ws_pending_until = 0
+local WS_PENDING_DELAY = 1.50
 local last_engage = 0
 local ENGAGE_RETRY = 0.40
 
@@ -76,6 +78,7 @@ local UPKEEP_ENABLED = false
 local UPKEEP_CHECK_INTERVAL = 0.50
 local UPKEEP_JA_RETRY_DELAY = 2.0
 local UPKEEP_FOOD_RETRY_DELAY = 10.0
+local UPKEEP_MA_CAST_RETRY_DELAY = 8.0
 local FOOD_BUFF_ID = 251
 
 local UPKEEP_JAS = {}
@@ -274,6 +277,8 @@ local function resolve_upkeep_ja(name)
         lead = 5,
         next_attempt = 0,
         active_until = 0,
+        casting_until = 0,
+        awaiting_buff = false,
     }
 end
 
@@ -324,9 +329,12 @@ local function resolve_upkeep_ma(name)
         buff_id = spell.status,
         duration = spell.duration,
         mp_cost = spell.mp_cost or 0,
+        cast_time = spell.cast_time or 3,
         lead = 5,
         next_attempt = 0,
         active_until = 0,
+        casting_until = 0,
+        awaiting_buff = false,
     }
 end
 
@@ -370,7 +378,37 @@ local function use_upkeep_ja(entry, now, player)
     if not player
     or player.status > 1
     or now < entry.next_attempt
-    or now < entry.active_until then
+    or now < (entry.casting_until or 0)
+    or now < ws_pending_until
+    then
+        return false
+    end
+
+    local buff_active = player_has_buff(entry.buff_id, player)
+
+    -- Once a JA has been submitted, wait for the buff event before
+    -- considering another cast. This prevents the upkeep JA from becoming
+    -- a repeating action while the client/server state catches up.
+    if entry.awaiting_buff then
+        if buff_active then
+            entry.awaiting_buff = false
+            entry.casting_until = 0
+            entry.next_attempt = now
+        elseif now < entry.next_attempt then
+            return false
+        else
+            -- Allow one retry after the previous JA had time to resolve.
+            entry.awaiting_buff = false
+        end
+    end
+
+    if buff_active then
+        if now < entry.active_until then
+            return false
+        end
+
+        -- The buff is still actually present. Do not refresh solely because
+        -- our predicted timer expired; wait for the real lose-buff event.
         return false
     end
 
@@ -378,30 +416,78 @@ local function use_upkeep_ja(entry, now, player)
         return false
     end
 
-    -- Give a ready WS priority over a maintenance JA.
+    -- Never allow maintenance JA to compete with a ready WS.
     if player.status == 1
     and player.vitals
-    and player.vitals.tp >= WS_TP then
+    and player.vitals.tp >= WS_TP
+    and ws_armed then
         return false
     end
 
     windower.chat.input('/ja "' .. entry.name .. '" <me>')
 
+    entry.casting_until = now + 1.0
     entry.next_attempt = now + UPKEEP_JA_RETRY_DELAY
+    entry.awaiting_buff = true
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Upkeep JA: ' .. entry.name
+        '[AutoClaim] Upkeep JA: ' .. entry.name .. ' (waiting for buff)'
     )
 
     return true
+end
+
+local function upkeep_ma_is_casting(now)
+    for _, entry in ipairs(UPKEEP_MAS) do
+        if now < (entry.casting_until or 0) then
+            return true
+        end
+    end
+
+    return false
 end
 
 local function use_upkeep_ma(entry, now, player)
     if not player
     or player.status > 1
     or now < entry.next_attempt
-    or now < entry.active_until then
+    or now < (entry.casting_until or 0)
+    or now < ws_pending_until
+    then
+        return false
+    end
+
+    local buff_active = player_has_buff(entry.buff_id, player)
+
+    -- Once we submit a maintenance spell, do NOT submit it again merely
+    -- because the buff list has not updated yet.  We wait for the gain-buff
+    -- event (or the explicit retry timeout) instead.  This is important for
+    -- spells such as Enlight II where the client/server buff event can lag
+    -- behind the cast.
+    if entry.awaiting_buff then
+        if buff_active then
+            entry.awaiting_buff = false
+            entry.casting_until = 0
+            entry.next_attempt = now
+        elseif now < entry.next_attempt then
+            return false
+        else
+            -- The previous cast has had plenty of time to resolve.  Allow
+            -- exactly one retry, then enter the same waiting state again.
+            entry.awaiting_buff = false
+        end
+    end
+
+    -- The live buff list is authoritative while the buff is active.
+    if buff_active then
+        if now < entry.active_until then
+            return false
+        end
+
+        -- The buff is actually present but our predicted expiry has arrived.
+        -- Do not refresh it during combat until the server reports it gone.
+        -- This prevents stale active_until data from causing recasts.
         return false
     end
 
@@ -409,26 +495,32 @@ local function use_upkeep_ma(entry, now, player)
         return false
     end
 
-    -- Do not try to cast a spell we cannot currently afford.
     if entry.mp_cost > 0
     and (not player.vitals or (player.vitals.mp or 0) < entry.mp_cost) then
         return false
     end
 
-    -- Give a ready WS priority over maintenance magic.
+    -- A ready WS always goes first.
     if player.status == 1
     and player.vitals
-    and player.vitals.tp >= WS_TP then
+    and player.vitals.tp >= WS_TP
+    and ws_armed then
         return false
     end
 
     windower.chat.input('/ma "' .. entry.name .. '" <me>')
 
-    entry.next_attempt = now + UPKEEP_JA_RETRY_DELAY
+    local cast_time = math.max(0.5, entry.cast_time or 3)
+    entry.casting_until = now + cast_time + 0.75
+    entry.next_attempt = now + UPKEEP_MA_CAST_RETRY_DELAY
+    entry.awaiting_buff = true
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Upkeep MA: ' .. entry.name
+        string.format(
+            '[AutoClaim] Upkeep MA: %s (waiting for buff)',
+            entry.name
+        )
     )
 
     return true
@@ -525,10 +617,11 @@ local function print_upkeep_status()
             windower.add_to_chat(
                 158,
                 string.format(
-                    '[AutoClaim] MA: %s | active=%s | recast=%.1fs | mp=%d | duration=%ds | lead=%ds',
+                    '[AutoClaim] MA: %s | active=%s | recast=%.1fs | MP=%d/%d | duration=%ds | lead=%ds',
                     entry.name,
                     player_has_buff(entry.buff_id, player) and 'yes' or 'no',
                     upkeep_spell_recast(entry),
+                    player and player.vitals and (player.vitals.mp or 0) or 0,
                     entry.mp_cost,
                     entry.duration,
                     entry.lead
@@ -853,6 +946,10 @@ local function use_weapon_skill()
     windower.chat.input('/ws "' .. weapon_skill .. '" <t>')
     advance_weapon_skill()
 
+    -- Give the WS time to actually execute before maintenance magic can
+    -- interrupt it. The simple TP latch still controls one WS per 1000 TP.
+    ws_pending_until = os.clock() + WS_PENDING_DELAY
+
     return true
 end
 
@@ -873,6 +970,7 @@ local function claim_mob(mob)
     locked_target = mob.id
     reset_weapon_skill_cycle()
     ws_armed = true
+    ws_pending_until = 0
 
     local claim_started = os.clock()
     local claim_sent_at = nil
@@ -1174,6 +1272,8 @@ windower.register_event('gain buff', function(buff_id)
         if entry.buff_id == buff_id then
             entry.active_until = now + math.max(1, entry.duration - entry.lead)
             entry.next_attempt = now
+            entry.casting_until = 0
+            entry.awaiting_buff = false
         end
     end
 
@@ -1181,6 +1281,8 @@ windower.register_event('gain buff', function(buff_id)
         if entry.buff_id == buff_id then
             entry.active_until = now + math.max(1, entry.duration - entry.lead)
             entry.next_attempt = now
+            entry.casting_until = 0
+            entry.awaiting_buff = false
         end
     end
 
@@ -1196,14 +1298,20 @@ windower.register_event('lose buff', function(buff_id)
     for _, entry in ipairs(UPKEEP_JAS) do
         if entry.buff_id == buff_id then
             entry.active_until = 0
-            entry.next_attempt = now
+            if not entry.awaiting_buff then
+                entry.next_attempt = now
+                entry.casting_until = 0
+            end
         end
     end
 
     for _, entry in ipairs(UPKEEP_MAS) do
         if entry.buff_id == buff_id then
             entry.active_until = 0
-            entry.next_attempt = now
+            if not entry.awaiting_buff then
+                entry.next_attempt = now
+                entry.casting_until = 0
+            end
         end
     end
 
@@ -1229,12 +1337,6 @@ windower.register_event('prerender', function()
         return
     end
 
-    -- Maintenance actions have priority, but only one action is issued per
-    -- upkeep tick. The claim/engage/WS state machine remains untouched.
-    if upkeep_tick(now, player) then
-        return
-    end
-
     ------------------------------------------------------------
     -- LOCKED TARGET BRANCH
     --
@@ -1249,6 +1351,9 @@ windower.register_event('prerender', function()
             locked_target = nil
             busy = false
             claim_generation = claim_generation + 1
+            reset_weapon_skill_cycle()
+            ws_armed = true
+            ws_pending_until = 0
             return
         end
 
@@ -1257,6 +1362,9 @@ windower.register_event('prerender', function()
             locked_target = nil
             busy = false
             claim_generation = claim_generation + 1
+            reset_weapon_skill_cycle()
+            ws_armed = true
+            ws_pending_until = 0
             return
         end
 
@@ -1281,7 +1389,12 @@ windower.register_event('prerender', function()
             ws_armed = true
         end
 
-        if ws_armed
+        -- WS always gets first priority.  Maintenance magic is deliberately
+        -- evaluated AFTER this block so an upkeep cast can never prevent a
+        -- ready WS from being submitted.
+        if now >= ws_pending_until
+        and not upkeep_ma_is_casting(now)
+        and ws_armed
         and player.status == 1
         and player.vitals
         and player.vitals.tp >= WS_TP
@@ -1330,6 +1443,17 @@ windower.register_event('prerender', function()
                     last_engage = os.clock()
                 end
             end, 0.15)
+        end
+
+        -- Only run upkeep after combat-critical work has had a chance to run.
+        -- In particular, this prevents an expired Enlight II from stealing
+        -- the frame in which a 1000+ TP WS should be submitted.
+        --
+        -- If we are actively engaged and the buff is still present, upkeep
+        -- does nothing. If the buff genuinely disappeared, upkeep may restore
+        -- it, but only after the WS/engage checks above have completed.
+        if not busy and upkeep_tick(now, player) then
+            return
         end
 
         return
@@ -1431,6 +1555,7 @@ windower.register_event('addon command', function(...)
         claim_generation = claim_generation + 1
         reset_weapon_skill_cycle()
         ws_armed = true
+        ws_pending_until = 0
 
         windower.add_to_chat(
             158,
@@ -1447,6 +1572,7 @@ windower.register_event('addon command', function(...)
             claim_generation = claim_generation + 1
             reset_weapon_skill_cycle()
             ws_armed = true
+            ws_pending_until = 0
         end
 
         windower.add_to_chat(
@@ -1987,7 +2113,7 @@ windower.register_event('load', function()
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Loaded v5.9 - target filters + multi-aggro priority + WS + upkeep'
+        '[AutoClaim] Loaded v5.14 - target filters + multi-aggro priority + WS + upkeep'
     )
 
     windower.add_to_chat(
