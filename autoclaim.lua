@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.26'
+_addon.version = '5.27'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -1012,12 +1012,12 @@ local function claim_mob(mob)
             next_target_refresh = now + 0.05
         end
 
-        -- CLAIM CONFIRMED.
-        -- The claim is complete, so hand combat over to the main watchdog.
-        -- Keep locked_target set until this mob actually dies/disappears.
-        -- That gives the watchdog a persistent opportunity to engage the mob
-        -- if the first /attack or raw engage packet does not take.
-        if current.claim_id == player.id and claim_action_sent then
+        -- ALREADY OURS / CLAIM CONFIRMED.
+        -- If this mob was already claimed by us before we selected it, there
+        -- is nothing to claim again. Go straight to the normal engage path.
+        -- If it was not already ours, this becomes true as soon as the
+        -- direct claim action succeeds and the server updates claim_id.
+        if current.claim_id == player.id then
             windower.add_to_chat(
                 158,
                 '[AutoClaim] *** CLAIMED *** ' .. current.name
