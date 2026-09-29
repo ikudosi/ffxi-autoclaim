@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.27'
+_addon.version = '6.0'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -27,33 +27,19 @@ local last_scan = 0
 -- (case-insensitive) are eligible for automatic claiming.
 local TARGET_ONLY_NAME = nil
 
--- Mobs that have recently performed an action against the player are
--- prioritized over ordinary unclaimed mobs. This is tracked from the
--- Windower action event because mob.target_index is not reliable for NPCs.
-local recent_attackers = {}
-local ATTACKER_PRIORITY_DURATION = 3.0
-
 -- A failed/expired target is temporarily ignored by the scanner.
 local failed_targets = {}
 local FAILED_TARGET_COOLDOWN = 1.5
 
--- Set by the incoming-text handler when FFXI explicitly reports that
--- the currently locked target is out of range for the claim action.
--- This is authoritative and avoids relying only on mob.distance.
-
--- How long to wait for the server to reflect a direct claim packet
--- before allowing another packet attempt.
+-- Give the server a short window to update claim_id after the claim packet.
 local CLAIM_RESPONSE_TIMEOUT = 0.20
-local CLAIM_MAX_WAIT = 60.0
--- If the claim action goes on recast without us receiving ownership,
--- do not sit on the mob. Release it so the scanner can keep watching it.
--- A short grace period allows a slightly delayed claim update to arrive.
-local CLAIM_RECAST_RELEASE_GRACE = 0.50
 
-local FACE_INTERVAL = 0.05
+-- Keep the character pointed at the active mob and retry engagement at a
+-- modest cadence. This is intentionally simple; no per-target state machine.
+local FACE_INTERVAL = 0.25
 local last_face = 0
 local last_engage = 0
-local ENGAGE_RETRY = 0.40
+local ENGAGE_RETRY = 0.75
 
 ------------------------------------------------------------
 -- Optional upkeep
@@ -637,7 +623,7 @@ local function send_claim_action(mob)
 end
 
 ------------------------------------------------------------
--- Scanner
+-- Scanner / claim / engage
 ------------------------------------------------------------
 
 local function target_name_matches(mob)
@@ -651,37 +637,6 @@ local function target_name_matches(mob)
 
     return mob.name
         and mob.name:lower() == TARGET_ONLY_NAME:lower()
-end
-
-local function remember_attacker(mob_id)
-    if mob_id then
-        recent_attackers[mob_id] = os.clock() + ATTACKER_PRIORITY_DURATION
-    end
-end
-
-local function is_recent_attacker(mob_id)
-    local expires = recent_attackers[mob_id]
-
-    if not expires then
-        return false
-    end
-
-    if os.clock() >= expires then
-        recent_attackers[mob_id] = nil
-        return false
-    end
-
-    return true
-end
-
-local function cleanup_recent_attackers()
-    local now = os.clock()
-
-    for mob_id, expires in pairs(recent_attackers) do
-        if now >= expires then
-            recent_attackers[mob_id] = nil
-        end
-    end
 end
 
 local function blacklist_target(mob_id)
@@ -722,9 +677,9 @@ local function is_eligible_mob(mob, player)
         return false
     end
 
-    -- We can only claim unclaimed mobs, or continue with one already
-    -- claimed by us.
-    return mob.claim_id == 0 or mob.claim_id == nil or mob.claim_id == player.id
+    return mob.claim_id == 0
+        or mob.claim_id == nil
+        or mob.claim_id == player.id
 end
 
 local function find_mob()
@@ -734,86 +689,17 @@ local function find_mob()
         return nil
     end
 
-    local player_mob = windower.ffxi.get_mob_by_target('me')
-
-    if not player_mob then
-        return nil
-    end
-
     local mobs = windower.ffxi.get_mob_array()
 
     if not mobs then
         return nil
     end
 
-    cleanup_recent_attackers()
-
-    ------------------------------------------------------------
-    -- PRIORITY 1:
-    -- A mob that actually attacked us recently wins immediately.
-    ------------------------------------------------------------
-
-    local attacker = nil
-    local attacker_distance = MAX_DISTANCE
-
-    for _, mob in pairs(mobs) do
-        if is_eligible_mob(mob, player)
-        and is_recent_attacker(mob.id) then
-            local dist = math.sqrt(mob.distance or 999999)
-
-            if dist <= attacker_distance then
-                attacker = mob
-                attacker_distance = dist
-            end
-        end
-    end
-
-    if attacker then
-        return attacker
-    end
-
-    ------------------------------------------------------------
-    -- PRIORITY 2:
-    -- If we already have multiple mobs claimed by us (for example,
-    -- because we aggroed 3 mobs at once), keep working through those
-    -- mobs before claiming a fresh one.
-    --
-    -- This is the important distinction from the old scanner:
-    -- claim_id == player.id means the mob is already ours, so we
-    -- should NOT send another claim attempt just to select it.
-    ------------------------------------------------------------
-
-    local owned = nil
-    local owned_distance = MAX_DISTANCE
-
-    for _, mob in pairs(mobs) do
-        if is_eligible_mob(mob, player)
-        and mob.claim_id == player.id then
-            local dist = math.sqrt(mob.distance or 999999)
-
-            if dist <= owned_distance then
-                owned = mob
-                owned_distance = dist
-            end
-        end
-    end
-
-    if owned then
-        return owned
-    end
-
-    ------------------------------------------------------------
-    -- PRIORITY 3:
-    -- Nothing is attacking us and we don't already own another mob,
-    -- so claim the nearest fresh/unclaimed matching mob.
-    ------------------------------------------------------------
-
     local closest = nil
     local closest_distance = MAX_DISTANCE
 
     for _, mob in pairs(mobs) do
-        if is_eligible_mob(mob, player)
-        and (mob.claim_id == 0 or mob.claim_id == nil) then
+        if is_eligible_mob(mob, player) then
             local dist = math.sqrt(mob.distance or 999999)
 
             if dist <= closest_distance then
@@ -826,35 +712,39 @@ local function find_mob()
     return closest
 end
 
-------------------------------------------------------------
--- Claim state machine
-------------------------------------------------------------
+local function clear_lock()
+    locked_target = nil
+    busy = false
+    claim_generation = claim_generation + 1
+end
+
+local function start_engagement(mob)
+    local player = windower.ffxi.get_player()
+
+    if not player or not mob then
+        return
+    end
+
+    target_mob(mob)
+    face_target(mob)
+    windower.chat.input('/attack <t>')
+    engage(mob)
+    last_engage = os.clock()
+end
 
 local function claim_mob(mob)
-    -- Every newly selected mob goes through the exact same claim path,
-    -- even if it is already claimed by us / already attacking us.
-    -- Do NOT gate target selection on the local recast table here.
-    -- Windower's recast data can briefly lag the actual ready state, and
-    -- the claim loop below is the single place that decides when to send
-    -- the claim action.
-
-    -- One and only one claim can exist at a time.
-    if busy or locked_target then
+    if not enabled or busy or locked_target or not mob then
         return
     end
 
     claim_generation = claim_generation + 1
     local my_generation = claim_generation
 
-    busy = true
     locked_target = mob.id
+    busy = true
 
-    local claim_started = os.clock()
     local claim_sent_at = nil
-    local claim_action_sent = false
     local last_claim_action = 0
-    local next_target_refresh = 0
-    local last_attack = 0
 
     windower.add_to_chat(
         158,
@@ -885,12 +775,10 @@ local function claim_mob(mob)
             blacklist_target(mob.id)
         end
 
-        locked_target = nil
-        busy = false
-        claim_generation = claim_generation + 1
+        clear_lock()
     end
 
-    local function engage_loop()
+    local function claim_loop()
         if not active() then
             return
         end
@@ -903,165 +791,54 @@ local function claim_mob(mob)
             return
         end
 
-        if current.claim_id ~= player.id then
-            release('Lost claim on ' .. current.name .. '.', true)
-            return
-        end
-
-        ------------------------------------------------------------
-        -- HARD ENGAGE LOOP
-        --
-        -- We do not assume that target_mob() means the client has
-        -- actually accepted the target yet. Re-establish the exact
-        -- target, verify <t>, face it, then issue both normal /attack
-        -- and the raw engage packet. Repeat until player.status == 1.
-        --
-        -- busy stays TRUE for the entire loop, so the scanner cannot
-        -- select another mob while we are trying to engage this one.
-        ------------------------------------------------------------
-
-        target_mob(current)
-        face_target(current)
-
-        if player.status == 1 then
-            -- Stay locked on the live combat target. The main watchdog will
-            -- clear locked_target when this mob dies/disappears, which then
-            -- allows the scanner to select the next mob and run the normal
-            -- claim sequence.
-            return
-        end
-
-        local target = windower.ffxi.get_mob_by_target('t')
-
-        -- Give the injected target a chance to become the real client
-        -- target. If something else has <t>, do not attack it.
-        if not target or target.id ~= current.id then
-            coroutine.schedule(engage_loop, 0.05)
-            return
-        end
-
-        local now = os.clock()
-
-        -- Normal client engage command.
-        if now - last_attack >= 0.15 then
-            target_mob(current)
-            face_target(current)
-            windower.chat.input('/attack <t>')
-            last_attack = now
-        end
-
-        -- Raw engage packet as a second, independent path.
-        if now - last_engage >= 0.15 then
-            target_mob(current)
-            face_target(current)
-            engage(current)
-            last_engage = now
-        end
-
-        -- Verify again very quickly. If the client did not enter
-        -- engaged status, repeat the entire target -> face -> engage
-        -- sequence against THIS SAME MOB.
-        coroutine.schedule(engage_loop, 0.10)
-    end
-
-    local function claim_loop()
-        if not active() then
-            return
-        end
-
-        local current = windower.ffxi.get_mob_by_id(mob.id)
-        local player = windower.ffxi.get_player()
-
-        if not current or not current.hpp or current.hpp <= 0 or not player then
-            release('Claim target disappeared.')
-            return
-        end
-
-        -- If somebody else gets it, THIS claim is finished. Only then may
-        -- another target be selected.
-        if current.claim_id and current.claim_id ~= 0
+        -- Someone else got the mob while we were trying to claim it.
+        if current.claim_id
+            and current.claim_id ~= 0
             and current.claim_id ~= player.id then
-            release('Target already claimed. Looking for next mob.', true)
+            release('Target already claimed by someone else.', true)
             return
         end
 
-        -- Do not keep trying to claim a target that has moved outside the
-        -- configured scan/claim range. Release it immediately so the scanner
-        -- can choose another eligible mob that is actually closer.
-        local current_distance = math.sqrt(current.distance or 999999)
-
-        if current_distance > MAX_DISTANCE then
+        -- Claim range applies only during the claim step. Once claim is
+        -- confirmed, combat is allowed to continue regardless of distance.
+        local distance = math.sqrt(current.distance or 999999)
+        if distance > MAX_DISTANCE then
             release(
                 string.format(
                     '%s moved out of range (%.1f yalms). Looking for another mob.',
                     current.name,
-                    current_distance
+                    distance
                 ),
                 false
             )
             return
         end
 
-        local now = os.clock()
+        target_mob(current)
+        face_target(current)
 
-        -- Keep the exact mob targeted/faced, but do not let this become a
-        -- selection mechanism. There is still only one locked target.
-        if now >= next_target_refresh then
-            target_mob(current)
-            face_target(current)
-            next_target_refresh = now + 0.05
-        end
-
-        -- ALREADY OURS / CLAIM CONFIRMED.
-        -- If this mob was already claimed by us before we selected it, there
-        -- is nothing to claim again. Go straight to the normal engage path.
-        -- If it was not already ours, this becomes true as soon as the
-        -- direct claim action succeeds and the server updates claim_id.
+        -- Already ours: there is nothing left to claim. Go straight to combat.
         if current.claim_id == player.id then
             windower.add_to_chat(
                 158,
                 '[AutoClaim] *** CLAIMED *** ' .. current.name
             )
 
-            target_mob(current)
-            face_target(current)
-
-            -- Claim work is finished. The prerender watchdog now owns the
-            -- engage/re-engage job while locked_target remains this mob.
             busy = false
-
-            -- Give engagement an immediate attempt instead of waiting for
-            -- the next watchdog interval. The watchdog will retry every
-            -- ENGAGE_RETRY seconds until player.status == 1.
-            windower.chat.input('/attack <t>')
-            engage(current)
-            last_engage = now
-
+            start_engagement(current)
             return
         end
 
-        -- If a direct packet was sent, give the server a short window to reflect
-        -- the result, then retry DIRECTLY against the same mob. We NEVER
-        -- fall back to /ja or /ma <t>, because that would reintroduce the
-        -- target-sync race. The short window keeps claim attempts fast
-        -- without ever releasing the locked target while the claim is pending.
-        if claim_sent_at then
-            if now - claim_sent_at < CLAIM_RESPONSE_TIMEOUT then
-                coroutine.schedule(claim_loop, 0.05)
-                return
-            end
-
-            claim_sent_at = nil
-        end
-
-        local recast = claim_recast()
-
-        if recast > 0 then
-            -- Stay on the newly selected target until the claim ability is
-            -- actually available. This also handles a brief stale recast
-            -- value from Windower without silently skipping the claim.
+        -- We sent the claim packet recently. Give FFXI a moment to update
+        -- claim_id before deciding whether another attempt is necessary.
+        local now = os.clock()
+        if claim_sent_at and now - claim_sent_at < CLAIM_RESPONSE_TIMEOUT then
             coroutine.schedule(claim_loop, 0.05)
             return
+        end
+
+        if claim_sent_at then
+            claim_sent_at = nil
         end
 
         if not CLAIM_ACTION_ID or not CLAIM_PACKET_CATEGORY then
@@ -1072,14 +849,16 @@ local function claim_mob(mob)
             return
         end
 
-        -- No menu/chat dependency. The packet goes directly to THIS mob.
+        -- If the ability is on recast, simply wait. The selected mob remains
+        -- locked and the scanner does not jump to another target.
+        if claim_recast() > 0 then
+            coroutine.schedule(claim_loop, 0.05)
+            return
+        end
+
+        -- This is the only place we actually attempt the claim ability.
         if now - last_claim_action >= 0.15 then
-            target_mob(current)
-            face_target(current)
-
             if send_claim_action(current) then
-                claim_action_sent = true
-
                 windower.add_to_chat(
                     158,
                     string.format(
@@ -1101,15 +880,13 @@ local function claim_mob(mob)
 end
 
 ------------------------------------------------------------
--- Incoming claim/range feedback
+-- Claim-range feedback
 ------------------------------------------------------------
 
--- FFXI's actual range response is more reliable than mob.distance for
--- determining whether a claim ability can reach the target. When the game
--- says the currently locked mob is out of range, immediately release that
--- target so the scanner can choose another one.
+-- Only treat an out-of-range message as a claim failure. Once the mob is
+-- claimed and we are in combat, its movement must never make us abandon it.
 windower.register_event('incoming text', function(original, modified, mode)
-    if not enabled or not locked_target or not busy then
+    if not enabled or not busy or not locked_target then
         return
     end
 
@@ -1122,60 +899,121 @@ windower.register_event('incoming text', function(original, modified, mode)
     local expected = 'The ' .. mob.name .. ' is out of range.'
 
     if original == expected or modified == expected then
-        local mob_id = locked_target
-        local mob_name = mob.name
+        local id = locked_target
+        blacklist_target(id)
+        clear_lock()
 
-        -- Temporarily suppress this target so the scanner does not
-        -- immediately select it again on the next prerender.
-        blacklist_target(mob_id)
-
-        locked_target = nil
-        busy = false
-        claim_generation = claim_generation + 1
-
-        windower.add_to_chat(123,
-            '[AutoClaim] ' .. mob_name ..
-            ' reported out of range. Looking for another mob.'
+        windower.add_to_chat(
+            123,
+            '[AutoClaim] ' .. mob.name .. ' is out of range. Looking for another mob.'
         )
     end
 end)
 
 ------------------------------------------------------------
--- Incoming combat priority
+-- Main watchdog
 ------------------------------------------------------------
 
--- A monster can attack us before the scanner has selected anything.
--- The action event gives us a reliable signal that the monster actually
--- acted on the player. We remember it briefly so the scanner can claim
--- that monster before choosing a different nearby mob.
-windower.register_event('action', function(action)
-    if not enabled or not action or not action.actor_id or not action.targets then
+windower.register_event('prerender', function()
+    if not enabled then
         return
     end
 
+    local now = os.clock()
     local player = windower.ffxi.get_player()
 
     if not player then
         return
     end
 
-    local actor = windower.ffxi.get_mob_by_id(action.actor_id)
+    ------------------------------------------------------------
+    -- DEATH FAIL-SAFE
+    ------------------------------------------------------------
 
-    if not actor
-        or not actor.is_npc
-        or actor.spawn_type ~= 16
-        or not actor.hpp
-        or actor.hpp <= 0
-        or not target_name_matches(actor) then
+    local player_dead = player.status == 2
+        or (player.vitals and player.vitals.hp and player.vitals.hp <= 0)
+
+    if player_dead then
+        enabled = false
+        clear_lock()
+
+        windower.add_to_chat(
+            123,
+            '[AutoClaim] OFF - player died.'
+        )
+
         return
     end
 
-    for _, target in pairs(action.targets) do
-        if target and target.id == player.id then
-            remember_attacker(actor.id)
+    ------------------------------------------------------------
+    -- ACTIVE TARGET
+    --
+    -- One target at a time. Keep looking at it and keep trying to engage it
+    -- until it dies, disappears, or we actually lose the claim.
+    ------------------------------------------------------------
+
+    if locked_target then
+        local mob = windower.ffxi.get_mob_by_id(locked_target)
+
+        if not mob or not mob.hpp or mob.hpp <= 0 then
+            clear_lock()
             return
         end
+
+        if mob.claim_id
+            and mob.claim_id ~= 0
+            and mob.claim_id ~= player.id then
+            clear_lock()
+            return
+        end
+
+        -- During the claim phase, claim_mob() handles range and ability use.
+        -- During combat, there is deliberately NO distance check here.
+        if now - last_face >= FACE_INTERVAL then
+            target_mob(mob)
+            face_target(mob)
+            last_face = now
+        end
+
+        -- Once the mob is ours, engagement is the only combat action AutoClaim
+        -- owns. AutoWS remains completely separate.
+        if not busy and mob.claim_id == player.id then
+            if player.status ~= 1 and now - last_engage >= ENGAGE_RETRY then
+                start_engagement(mob)
+            end
+        end
+
+        -- Upkeep may continue during combat, but never while a claim is in
+        -- progress. This preserves the existing JA/MA/food behavior.
+        if not busy and upkeep_tick(now, player) then
+            return
+        end
+
+        return
     end
+
+    ------------------------------------------------------------
+    -- NO ACTIVE TARGET: scan only when we are not already engaged.
+    ------------------------------------------------------------
+
+    if busy or player.status == 1 then
+        return
+    end
+
+    if now - last_scan < SCAN_INTERVAL then
+        return
+    end
+
+    last_scan = now
+
+    local mob = find_mob()
+
+    if mob then
+        claim_mob(mob)
+        return
+    end
+
+    upkeep_tick(now, player)
 end)
 
 ------------------------------------------------------------
@@ -1235,179 +1073,6 @@ windower.register_event('lose buff', function(buff_id)
     if buff_id == FOOD_BUFF_ID then
         upkeep_food_expires = 0
         upkeep_food_next_attempt = now
-    end
-end)
-
-------------------------------------------------------------
--- Main watchdog
-------------------------------------------------------------
-
-windower.register_event('prerender', function()
-    if not enabled then
-        return
-    end
-
-    local now = os.clock()
-    local player = windower.ffxi.get_player()
-
-    if not player then
-        return
-    end
-
-    ------------------------------------------------------------
-    -- DEATH FAIL-SAFE
-    --
-    -- If the player dies while AutoClaim is enabled, immediately shut
-    -- the addon down. This prevents any pending claim/engage/upkeep
-    -- coroutines from continuing while dead.
-    ------------------------------------------------------------
-
-    local player_dead = player.status == 2
-        or (player.vitals and player.vitals.hp and player.vitals.hp <= 0)
-
-    if player_dead then
-        enabled = false
-        busy = false
-        locked_target = nil
-        claim_generation = claim_generation + 1
-
-        windower.add_to_chat(
-            123,
-            '[AutoClaim] OFF - player died.'
-        )
-
-        return
-    end
-
-    ------------------------------------------------------------
-    -- LOCKED TARGET BRANCH
-    --
-    -- While locked_target exists, there is NO scanner.
-    -- This is true during claim attempts, claim confirmation, and engagement.
-    ------------------------------------------------------------
-
-    if locked_target then
-        local mob = windower.ffxi.get_mob_by_id(locked_target)
-
-        if not mob or not mob.hpp or mob.hpp <= 0 then
-            locked_target = nil
-            busy = false
-            claim_generation = claim_generation + 1
-            return
-        end
-
-        if mob.claim_id and mob.claim_id ~= 0
-            and mob.claim_id ~= player.id then
-            locked_target = nil
-            busy = false
-            claim_generation = claim_generation + 1
-            return
-        end
-
-        -- If the locked mob moves outside our configured claim range, stop
-        -- retrying it. The scanner will immediately get a chance to select a
-        -- closer eligible mob instead of spamming claim/engage attempts at a
-        -- target the game reports as out of range.
-        local locked_distance = math.sqrt(mob.distance or 999999)
-
-        if locked_distance > MAX_DISTANCE then
-            windower.add_to_chat(
-                123,
-                string.format(
-                    '[AutoClaim] %s out of range (%.1f yalms). Releasing target.',
-                    mob.name,
-                    locked_distance
-                )
-            )
-
-            locked_target = nil
-            busy = false
-            claim_generation = claim_generation + 1
-            return
-        end
-
-        if now - last_face >= FACE_INTERVAL then
-            target_mob(mob)
-            face_target(mob)
-            last_face = now
-        end
-
-        --------------------------------------------------------
-        -- Engage watchdog after claim confirmation.
-        --------------------------------------------------------
-
-        if not busy
-        and player.status ~= 1
-        and mob.claim_id == player.id
-        and now - last_engage >= ENGAGE_RETRY then
-
-            target_mob(mob)
-            face_target(mob)
-            engage(mob)
-            last_engage = now
-
-            local generation = claim_generation
-
-            coroutine.schedule(function()
-                if generation ~= claim_generation
-                    or not locked_target
-                    or locked_target ~= mob.id then
-                    return
-                end
-
-                local p = windower.ffxi.get_player()
-                local current = windower.ffxi.get_mob_by_id(mob.id)
-
-                if p
-                and p.status ~= 1
-                and current
-                and current.hpp
-                and current.hpp > 0
-                and current.claim_id == p.id then
-
-                    target_mob(current)
-                    face_target(current)
-                    windower.chat.input('/attack <t>')
-                    last_engage = os.clock()
-                end
-            end, 0.15)
-        end
-
-        -- Only run upkeep after combat-critical work has had a chance to run.
-        -- In particular, this prevents an expired Enlight II from stealing
-        --
-        -- If we are actively engaged and the buff is still present, upkeep
-        -- does nothing. If the buff genuinely disappeared, upkeep may restore
-        -- it, but only after the engage checks above have completed.
-        if not busy and upkeep_tick(now, player) then
-            return
-        end
-
-        return
-    end
-
-    ------------------------------------------------------------
-    -- NO LOCK: scanner is allowed.
-    ------------------------------------------------------------
-
-    if busy then
-        return
-    end
-
-    if player.status == 1 then
-        return
-    end
-
-    if now - last_scan < SCAN_INTERVAL then
-        return
-    end
-
-    last_scan = now
-
-    local mob = find_mob()
-
-    if mob then
-        claim_mob(mob)
     end
 end)
 
@@ -1979,11 +1644,8 @@ windower.register_event('load', function()
 
     windower.add_to_chat(
         158,
-        '[AutoClaim] Loaded v' .. _addon.version .. ' - target filters + multi-aggro priority + upkeep'
+        '[AutoClaim] Loaded v' .. _addon.version .. ' - scan -> claim -> engage -> face + upkeep'
     )
 
-    windower.add_to_chat(
-        158,
-        '[AutoClaim] //ac on'
-    )
+    windower.add_to_chat(158,'[AutoClaim] To view list of commands type: //ac help')
 end)
