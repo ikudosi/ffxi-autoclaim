@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '6.0'
+_addon.version = '6.1'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -799,21 +799,6 @@ local function claim_mob(mob)
             return
         end
 
-        -- Claim range applies only during the claim step. Once claim is
-        -- confirmed, combat is allowed to continue regardless of distance.
-        local distance = math.sqrt(current.distance or 999999)
-        if distance > MAX_DISTANCE then
-            release(
-                string.format(
-                    '%s moved out of range (%.1f yalms). Looking for another mob.',
-                    current.name,
-                    distance
-                ),
-                false
-            )
-            return
-        end
-
         target_mob(current)
         face_target(current)
 
@@ -849,8 +834,8 @@ local function claim_mob(mob)
             return
         end
 
-        -- If the ability is on recast, simply wait. The selected mob remains
-        -- locked and the scanner does not jump to another target.
+        -- If the ability is on recast, the claim action executed. Keep
+        -- waiting for the server to reflect ownership; do not re-send it.
         if claim_recast() > 0 then
             coroutine.schedule(claim_loop, 0.05)
             return
@@ -858,6 +843,23 @@ local function claim_mob(mob)
 
         -- This is the only place we actually attempt the claim ability.
         if now - last_claim_action >= 0.15 then
+            local distance = math.sqrt(current.distance or 999999)
+
+            -- If we have not actually executed the ability and the mob has
+            -- moved beyond the configured claim range, release it. The
+            -- scanner can pick it up again if it comes back into range.
+            if distance > MAX_DISTANCE then
+                release(
+                    string.format(
+                        '%s moved out of range (%.1f yalms). Looking for another mob.',
+                        current.name,
+                        distance
+                    ),
+                    false
+                )
+                return
+            end
+
             if send_claim_action(current) then
                 windower.add_to_chat(
                     158,
@@ -1647,5 +1649,8 @@ windower.register_event('load', function()
         '[AutoClaim] Loaded v' .. _addon.version .. ' - scan -> claim -> engage -> face + upkeep'
     )
 
-    windower.add_to_chat(158,'[AutoClaim] To view list of commands type: //ac help')
+    windower.add_to_chat(
+        158,
+        '[AutoClaim] //ac on'
+    )
 end)
