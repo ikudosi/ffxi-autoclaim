@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.24'
+_addon.version = '5.26'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -36,6 +36,10 @@ local ATTACKER_PRIORITY_DURATION = 3.0
 -- A failed/expired target is temporarily ignored by the scanner.
 local failed_targets = {}
 local FAILED_TARGET_COOLDOWN = 1.5
+
+-- Set by the incoming-text handler when FFXI explicitly reports that
+-- the currently locked target is out of range for the claim action.
+-- This is authoritative and avoids relying only on mob.distance.
 
 -- How long to wait for the server to reflect a direct claim packet
 -- before allowing another packet attempt.
@@ -981,6 +985,23 @@ local function claim_mob(mob)
             return
         end
 
+        -- Do not keep trying to claim a target that has moved outside the
+        -- configured scan/claim range. Release it immediately so the scanner
+        -- can choose another eligible mob that is actually closer.
+        local current_distance = math.sqrt(current.distance or 999999)
+
+        if current_distance > MAX_DISTANCE then
+            release(
+                string.format(
+                    '%s moved out of range (%.1f yalms). Looking for another mob.',
+                    current.name,
+                    current_distance
+                ),
+                false
+            )
+            return
+        end
+
         local now = os.clock()
 
         -- Keep the exact mob targeted/faced, but do not let this become a
@@ -1078,6 +1099,46 @@ local function claim_mob(mob)
 
     claim_loop()
 end
+
+------------------------------------------------------------
+-- Incoming claim/range feedback
+------------------------------------------------------------
+
+-- FFXI's actual range response is more reliable than mob.distance for
+-- determining whether a claim ability can reach the target. When the game
+-- says the currently locked mob is out of range, immediately release that
+-- target so the scanner can choose another one.
+windower.register_event('incoming text', function(original, modified, mode)
+    if not enabled or not locked_target or not busy then
+        return
+    end
+
+    local mob = windower.ffxi.get_mob_by_id(locked_target)
+
+    if not mob or not mob.name then
+        return
+    end
+
+    local expected = 'The ' .. mob.name .. ' is out of range.'
+
+    if original == expected or modified == expected then
+        local mob_id = locked_target
+        local mob_name = mob.name
+
+        -- Temporarily suppress this target so the scanner does not
+        -- immediately select it again on the next prerender.
+        blacklist_target(mob_id)
+
+        locked_target = nil
+        busy = false
+        claim_generation = claim_generation + 1
+
+        windower.add_to_chat(123,
+            '[AutoClaim] ' .. mob_name ..
+            ' reported out of range. Looking for another mob.'
+        )
+    end
+end)
 
 ------------------------------------------------------------
 -- Incoming combat priority
@@ -1237,6 +1298,28 @@ windower.register_event('prerender', function()
 
         if mob.claim_id and mob.claim_id ~= 0
             and mob.claim_id ~= player.id then
+            locked_target = nil
+            busy = false
+            claim_generation = claim_generation + 1
+            return
+        end
+
+        -- If the locked mob moves outside our configured claim range, stop
+        -- retrying it. The scanner will immediately get a chance to select a
+        -- closer eligible mob instead of spamming claim/engage attempts at a
+        -- target the game reports as out of range.
+        local locked_distance = math.sqrt(mob.distance or 999999)
+
+        if locked_distance > MAX_DISTANCE then
+            windower.add_to_chat(
+                123,
+                string.format(
+                    '[AutoClaim] %s out of range (%.1f yalms). Releasing target.',
+                    mob.name,
+                    locked_distance
+                )
+            )
+
             locked_target = nil
             busy = false
             claim_generation = claim_generation + 1
