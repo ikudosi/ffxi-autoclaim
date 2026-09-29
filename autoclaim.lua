@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '5.20'
+_addon.version = '5.24'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -829,12 +829,10 @@ end
 local function claim_mob(mob)
     -- Every newly selected mob goes through the exact same claim path,
     -- even if it is already claimed by us / already attacking us.
-    -- The claim ability is the normal gate before we lock onto it.
-    local initial_recast = claim_recast()
-
-    if initial_recast > 0 then
-        return
-    end
+    -- Do NOT gate target selection on the local recast table here.
+    -- Windower's recast data can briefly lag the actual ready state, and
+    -- the claim loop below is the single place that decides when to send
+    -- the claim action.
 
     -- One and only one claim can exist at a time.
     if busy or locked_target then
@@ -922,7 +920,10 @@ local function claim_mob(mob)
         face_target(current)
 
         if player.status == 1 then
-            busy = false
+            -- Stay locked on the live combat target. The main watchdog will
+            -- clear locked_target when this mob dies/disappears, which then
+            -- allows the scanner to select the next mob and run the normal
+            -- claim sequence.
             return
         end
 
@@ -991,9 +992,10 @@ local function claim_mob(mob)
         end
 
         -- CLAIM CONFIRMED.
-        -- This check is deliberately independent of <t>. The claim action
-        -- was sent directly to this mob's ID/index, so another player's
-        -- target selection cannot make our claim packet hit the wrong mob.
+        -- The claim is complete, so hand combat over to the main watchdog.
+        -- Keep locked_target set until this mob actually dies/disappears.
+        -- That gives the watchdog a persistent opportunity to engage the mob
+        -- if the first /attack or raw engage packet does not take.
         if current.claim_id == player.id and claim_action_sent then
             windower.add_to_chat(
                 158,
@@ -1003,31 +1005,17 @@ local function claim_mob(mob)
             target_mob(current)
             face_target(current)
 
-            local function handoff_to_engage()
-                if not active() then
-                    return
-                end
+            -- Claim work is finished. The prerender watchdog now owns the
+            -- engage/re-engage job while locked_target remains this mob.
+            busy = false
 
-                local p = windower.ffxi.get_player()
-                local target = windower.ffxi.get_mob_by_id(mob.id)
+            -- Give engagement an immediate attempt instead of waiting for
+            -- the next watchdog interval. The watchdog will retry every
+            -- ENGAGE_RETRY seconds until player.status == 1.
+            windower.chat.input('/attack <t>')
+            engage(current)
+            last_engage = now
 
-                if not p or not target or not target.hpp or target.hpp <= 0 then
-                    release('Claim target disappeared.')
-                    return
-                end
-
-                target_mob(target)
-                face_target(target)
-
-                if not target_matches(target) then
-                    coroutine.schedule(handoff_to_engage, 0.05)
-                    return
-                end
-
-                engage_loop()
-            end
-
-            coroutine.schedule(handoff_to_engage, 0.05)
             return
         end
 
@@ -1048,27 +1036,9 @@ local function claim_mob(mob)
         local recast = claim_recast()
 
         if recast > 0 then
-            -- The important distinction: an ability being on recast means
-            -- another claim packet cannot currently be submitted. Do not
-            -- hold the mob hostage for seconds while waiting on recast.
-            --
-            -- If this packet was just sent, give the server a brief grace
-            -- window to update claim_id before releasing the target.
-            local since_last_send = last_claim_action > 0
-                and (now - last_claim_action)
-                or math.huge
-
-            if since_last_send >= CLAIM_RECAST_RELEASE_GRACE then
-                release(
-                    string.format(
-                        'Claim action on recast (%.1fs) without ownership. Releasing target.',
-                        recast
-                    ),
-                    false
-                )
-                return
-            end
-
+            -- Stay on the newly selected target until the claim ability is
+            -- actually available. This also handles a brief stale recast
+            -- value from Windower without silently skipping the claim.
             coroutine.schedule(claim_loop, 0.05)
             return
         end
@@ -1220,6 +1190,31 @@ windower.register_event('prerender', function()
     local player = windower.ffxi.get_player()
 
     if not player then
+        return
+    end
+
+    ------------------------------------------------------------
+    -- DEATH FAIL-SAFE
+    --
+    -- If the player dies while AutoClaim is enabled, immediately shut
+    -- the addon down. This prevents any pending claim/engage/upkeep
+    -- coroutines from continuing while dead.
+    ------------------------------------------------------------
+
+    local player_dead = player.status == 2
+        or (player.vitals and player.vitals.hp and player.vitals.hp <= 0)
+
+    if player_dead then
+        enabled = false
+        busy = false
+        locked_target = nil
+        claim_generation = claim_generation + 1
+
+        windower.add_to_chat(
+            123,
+            '[AutoClaim] OFF - player died.'
+        )
+
         return
     end
 
