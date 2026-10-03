@@ -1,13 +1,13 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '6.1'
+_addon.version = '6.3'
 
 _addon.commands = {'ac', 'autoclaim'}
 
 local packets = require('packets')
 local res = require('resources')
 
-local MAX_DISTANCE = 16.5
+local MAX_DISTANCE = 20
 local SCAN_INTERVAL = 0.25
 
 -- Claim ability configuration.
@@ -848,12 +848,16 @@ local function claim_mob(mob)
             -- If we have not actually executed the ability and the mob has
             -- moved beyond the configured claim range, release it. The
             -- scanner can pick it up again if it comes back into range.
+            -- MAX_DISTANCE is the sole scan/claim candidate radius.
+            -- If this locked candidate moves beyond it before ownership, release
+            -- it and let the scanner select another eligible mob.
             if distance > MAX_DISTANCE then
                 release(
                     string.format(
-                        '%s moved out of range (%.1f yalms). Looking for another mob.',
+                        '%s moved outside scan range (%.1f / %.1f yalms). Trying another mob.',
                         current.name,
-                        distance
+                        distance,
+                        MAX_DISTANCE
                     ),
                     false
                 )
@@ -888,26 +892,23 @@ end
 -- Only treat an out-of-range message as a claim failure. Once the mob is
 -- claimed and we are in combat, its movement must never make us abandon it.
 windower.register_event('incoming text', function(original, modified, mode)
+    -- Name-only range text can be delayed or refer to another same-name mob.
+    -- Do not release a lock based on chat text; claim_loop() evaluates the
+    -- locked entity's live distance and ownership.
     if not enabled or not busy or not locked_target then
         return
     end
 
     local mob = windower.ffxi.get_mob_by_id(locked_target)
-
     if not mob or not mob.name then
         return
     end
 
     local expected = 'The ' .. mob.name .. ' is out of range.'
-
     if original == expected or modified == expected then
-        local id = locked_target
-        blacklist_target(id)
-        clear_lock()
-
         windower.add_to_chat(
             123,
-            '[AutoClaim] ' .. mob.name .. ' is out of range. Looking for another mob.'
+            '[AutoClaim] Out-of-range response received; checking locked mob state.'
         )
     end
 end)
