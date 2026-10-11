@@ -1,6 +1,6 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '8.0'
+_addon.version = '8.1'
 
 _addon.commands = {'ac', 'autoclaim'}
 
@@ -25,9 +25,9 @@ local TARGET_ONLY_NAME = nil
 local state = 'IDLE'
 local current_target = nil
 local claim_sent_time = 0
-local CLAIM_TIMEOUT = 1.5 -- Max seconds to wait for server response after sending claim packet
+local CLAIM_TIMEOUT = 2.5 -- Increased to 2.5s for server latency
 
--- Blacklist setup for failed claims
+-- Blacklist setup for failed/stolen claims
 local failed_targets = {}
 local FAILED_TARGET_COOLDOWN = 2.0
 
@@ -109,6 +109,25 @@ local function claim_recast()
     return recasts and recasts[CLAIM_RECAST_ID] or 0
 end
 
+-- CRITICAL FAIL-SAFE: Check if any mob nearby is ALREADY claimed by us
+local function find_my_claimed_mob()
+    local player = windower.ffxi.get_player()
+    if not player then return nil end
+
+    local mobs = windower.ffxi.get_mob_array()
+    if not mobs then return nil end
+
+    for _, mob in pairs(mobs) do
+        if mob.is_npc and mob.hpp and mob.hpp > 0 and mob.valid_target and mob.spawn_type == 16 then
+            if mob.claim_id == player.id then
+                return mob
+            end
+        end
+    end
+
+    return nil
+end
+
 local function is_eligible_mob(mob, player)
     if not mob or not mob.id or not mob.index or not mob.name
         or not player or mob.id == player.id or not mob.is_npc
@@ -117,7 +136,12 @@ local function is_eligible_mob(mob, player)
         return false
     end
 
-    -- Skip if on failure cooldown
+    -- Never ignore a mob that is claimed by us
+    if mob.claim_id == player.id then
+        return true
+    end
+
+    -- Skip if blacklisted because another player claimed it
     if failed_targets[mob.id] and os.clock() < failed_targets[mob.id] then
         return false
     end
@@ -129,7 +153,7 @@ local function is_eligible_mob(mob, player)
         end
     end
 
-    return mob.claim_id == 0 or mob.claim_id == nil or mob.claim_id == player.id
+    return mob.claim_id == 0 or mob.claim_id == nil
 end
 
 local function find_best_target()
@@ -200,7 +224,7 @@ windower.register_event('incoming text', function(original, modified, mode)
     local text = modified or original or ''
     if text:find(' is out of range%.', 1, false) then
         local mob_id = current_target
-        reset_state('Target out of range. Releasing and blacklisting.', mob_id)
+        reset_state('Target out of range. Releasing.', mob_id)
     end
 end)
 
@@ -223,6 +247,22 @@ windower.register_event('prerender', function()
     end
 
     --------------------------------------------------------
+    -- FAIL-SAFE CHECK: If ANY mob nearby is claimed by us, ENGAGE IT IMMEDIATELY
+    --------------------------------------------------------
+    if state ~= 'ENGAGED' then
+        local claimed_mob = find_my_claimed_mob()
+        if claimed_mob then
+            if current_target ~= claimed_mob.id or state ~= 'ENGAGED' then
+                windower.add_to_chat(158, '[AutoClaim] *** CLAIMED *** ' .. claimed_mob.name)
+                current_target = claimed_mob.id
+                state = 'ENGAGED'
+                start_engagement(claimed_mob)
+                return
+            end
+        end
+    end
+
+    --------------------------------------------------------
     -- STATE 1: IDLE / SCANNING
     --------------------------------------------------------
     if state == 'IDLE' then
@@ -233,7 +273,7 @@ windower.register_event('prerender', function()
         local mob = find_best_target()
 
         if mob then
-            if claim_recast() > 0 then return end -- Wait for claim ability to be off recast
+            if claim_recast() > 0 then return end -- Wait for claim ability recast
 
             current_target = mob.id
             state = 'CLAIMING'
@@ -261,7 +301,7 @@ windower.register_event('prerender', function()
             return
         end
 
-        -- Target was claimed by someone else
+        -- Target was claimed by someone else -> ONLY place on blacklist if another player owns it
         if mob.claim_id and mob.claim_id ~= 0 and mob.claim_id ~= player.id then
             reset_state('Target claimed by another player.', mob.id)
             return
@@ -275,9 +315,10 @@ windower.register_event('prerender', function()
             return
         end
 
-        -- TIMEOUT: We sent the packet, but server hasn't given us claim_id in 1.5s
+        -- TIMEOUT: Packet sent, but server hasn't updated client within 2.5s
         if now - claim_sent_time > CLAIM_TIMEOUT then
-            reset_state('Claim packet timed out without confirmation.', mob.id)
+            -- DO NOT blacklist this mob ID! Just drop back to IDLE so find_my_claimed_mob or find_best_target can pick it back up if Provoke landed.
+            reset_state('Claim packet timed out waiting for server. Retrying scan.')
             return
         end
 
