@@ -1,13 +1,13 @@
 _addon.name = 'AutoClaim'
 _addon.author = 'You'
-_addon.version = '8.1'
+_addon.version = '8.2'
 
 _addon.commands = {'ac', 'autoclaim'}
 
 local packets = require('packets')
 local res = require('resources')
 
-local MAX_DISTANCE = 20
+local MAX_DISTANCE = 18 -- Reduced slightly from 20 to avoid edge-case range drops
 local SCAN_INTERVAL = 0.25
 
 -- Claim configuration
@@ -25,11 +25,15 @@ local TARGET_ONLY_NAME = nil
 local state = 'IDLE'
 local current_target = nil
 local claim_sent_time = 0
-local CLAIM_TIMEOUT = 2.5 -- Increased to 2.5s for server latency
+local CLAIM_TIMEOUT = 2.0 
+
+-- Cooldown / Race-Condition Safeguards
+local last_claim_packet_sent = 0
+local CLAIM_PACKET_DEBOUNCE = 1.5 -- Hard minimum delay between injecting claim packets
 
 -- Blacklist setup for failed/stolen claims
 local failed_targets = {}
-local FAILED_TARGET_COOLDOWN = 2.0
+local FAILED_TARGET_COOLDOWN = 3.0
 
 -- Combat retry cadences
 local FACE_INTERVAL = 0.25
@@ -100,6 +104,11 @@ end
 local function claim_recast()
     if not CLAIM_RECAST_ID or not CLAIM_ACTION_ID then return 999 end
 
+    -- Check hard debounce time first to stop packet spam desync
+    if os.clock() - last_claim_packet_sent < CLAIM_PACKET_DEBOUNCE then
+        return 999
+    end
+
     if CLAIM_TYPE == 'ma' then
         local recasts = windower.ffxi.get_spell_recasts()
         return recasts and recasts[CLAIM_RECAST_ID] or 0
@@ -141,7 +150,7 @@ local function is_eligible_mob(mob, player)
         return true
     end
 
-    -- Skip if blacklisted because another player claimed it
+    -- Skip if blacklisted because another player claimed it or out-of-range fail
     if failed_targets[mob.id] and os.clock() < failed_targets[mob.id] then
         return false
     end
@@ -189,6 +198,8 @@ local function send_claim_action(mob)
         ['Param'] = CLAIM_ACTION_ID,
         ['X Offset'] = 0, ['Z Offset'] = 0, ['Y Offset'] = 0,
     })
+    
+    last_claim_packet_sent = os.clock()
     packets.inject(packet)
     return true
 end
@@ -247,18 +258,16 @@ windower.register_event('prerender', function()
     end
 
     --------------------------------------------------------
-    -- FAIL-SAFE CHECK: If ANY mob nearby is claimed by us, ENGAGE IT IMMEDIATELY
+    -- CRITICAL OVERRIDE: If ANY mob nearby is claimed by us, ENGAGE IT IMMEDIATELY
     --------------------------------------------------------
-    if state ~= 'ENGAGED' then
-        local claimed_mob = find_my_claimed_mob()
-        if claimed_mob then
-            if current_target ~= claimed_mob.id or state ~= 'ENGAGED' then
-                windower.add_to_chat(158, '[AutoClaim] *** CLAIMED *** ' .. claimed_mob.name)
-                current_target = claimed_mob.id
-                state = 'ENGAGED'
-                start_engagement(claimed_mob)
-                return
-            end
+    local claimed_mob = find_my_claimed_mob()
+    if claimed_mob then
+        if current_target ~= claimed_mob.id or state ~= 'ENGAGED' then
+            windower.add_to_chat(158, '[AutoClaim] *** CLAIMED *** ' .. claimed_mob.name)
+            current_target = claimed_mob.id
+            state = 'ENGAGED'
+            start_engagement(claimed_mob)
+            return
         end
     end
 
@@ -270,11 +279,12 @@ windower.register_event('prerender', function()
         if now - last_scan < SCAN_INTERVAL then return end
 
         last_scan = now
+        
+        -- Check recast with hard internal debounce
+        if claim_recast() > 0 then return end
+
         local mob = find_best_target()
-
         if mob then
-            if claim_recast() > 0 then return end -- Wait for claim ability recast
-
             current_target = mob.id
             state = 'CLAIMING'
             claim_sent_time = now
@@ -315,9 +325,8 @@ windower.register_event('prerender', function()
             return
         end
 
-        -- TIMEOUT: Packet sent, but server hasn't updated client within 2.5s
+        -- TIMEOUT: Packet sent, but server hasn't updated client within timeout window
         if now - claim_sent_time > CLAIM_TIMEOUT then
-            -- DO NOT blacklist this mob ID! Just drop back to IDLE so find_my_claimed_mob or find_best_target can pick it back up if Provoke landed.
             reset_state('Claim packet timed out waiting for server. Retrying scan.')
             return
         end
